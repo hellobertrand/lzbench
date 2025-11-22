@@ -86,6 +86,7 @@ Supported compressors
  - [tornado 0.6a](https://encode.su/threads/231-FreeArc-compression-suite-%284x4-Tornado-REP-Delta-Dict-%29)
  - [ucl 1.03](http://www.oberhumer.com/opensource/ucl/)
  - [xz 5.8.1](https://github.com/tukaani-project/xz)
+ - [xzk 0.0.1](https://github.com/hellobertrand/data-compression)
  - [zlib 1.3.1](http://zlib.net)
  - [zlib-ng 2.2.5](https://github.com/zlib-ng/zlib-ng)
  - [zling 2018-10-12](https://github.com/richox/libzling) - according to the author using libzling in a production environment is not a good idea
