@@ -550,12 +550,12 @@ int64_t lzbench_tamp_decompress(char *inbuf, size_t insize, char *outbuf, size_t
 #define lzbench_tamp_decompress NULL
 #endif
 
-// #ifndef BENCH_REMOVE_XZK
-// int64_t lzbench_xzk_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options);
-// int64_t lzbench_xzk_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options);
+// #ifndef BENCH_REMOVE_ZXC
+// int64_t lzbench_zxc_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options);
+// int64_t lzbench_zxc_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options);
 // #else
-// #define lzbench_xzk_compress NULL
-// #define lzbench_xzk_decompress NULL
+// #define lzbench_zxc_compress NULL
+// #define lzbench_zxc_decompress NULL
 // #endif
 
 #endif // LZBENCH_COMPRESSORS_H

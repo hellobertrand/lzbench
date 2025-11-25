@@ -1787,13 +1787,13 @@ int64_t lzbench_zstd_LDM_compress(char *inbuf, size_t insize, char *outbuf, size
 }
 #endif
 
-// #ifndef BENCH_REMOVE_XZK
-// #include "xzk/xzk.h"
-// #include "xzk/xzk_internal.h"
+// #ifndef BENCH_REMOVE_ZXC
+// #include "zxc/zxc.h"
+// #include "zxc/zxc_internal.h"
 
-// int64_t lzbench_xzk_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+// int64_t lzbench_zxc_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
 // {
-//     (void)codec_options; // Paramètre ignoré pour l'instant (valeurs par défaut)
+//     (void)codec_options;
 
 //     // Conversion des types char* -> uint8_t*
 //     const uint8_t *src = (const uint8_t *)inbuf;
@@ -1801,18 +1801,18 @@ int64_t lzbench_zstd_LDM_compress(char *inbuf, size_t insize, char *outbuf, size
 //     uint8_t *dst_start = dst;
 //     const uint8_t *dst_end = dst + outsize;
 
-//     xzk_cctx_t ctx;
+//     zxc_cctx_t ctx;
 //     // Initialisation avec la taille de chunk par défaut
-//     if (xzk_cctx_init(&ctx, XZK_CHUNK_SIZE) != 0)
+//     if (zxc_cctx_init(&ctx, XZK_CHUNK_SIZE, 0, 5) != 0)
 //     {
 //         return 0; // Erreur d'allocation
 //     }
 
 //     // 1. Écriture du File Header
-//     int h_size = xzk_write_file_header(dst, dst_end - dst);
+//     int h_size = zxc_write_file_header(dst, dst_end - dst);
 //     if (h_size < 0)
 //     {
-//         xzk_cctx_free(&ctx);
+//         zxc_cctx_free(&ctx);
 //         return 0; // Buffer trop petit
 //     }
 //     dst += h_size;
@@ -1822,7 +1822,7 @@ int64_t lzbench_zstd_LDM_compress(char *inbuf, size_t insize, char *outbuf, size
 //     while (pos < insize)
 //     {
 //         // Calcul de la taille du chunk courant
-//         size_t chunk_len = (insize - pos > XZK_CHUNK_SIZE) ? XZK_CHUNK_SIZE : (insize - pos);
+//         size_t chunk_len = (insize - pos > ZXC_CHUNK_SIZE) ? ZXC_CHUNK_SIZE : (insize - pos);
 //         size_t rem_cap = dst_end - dst;
 
 //         // Appel à la fonction statique interne existante
@@ -1830,7 +1830,7 @@ int64_t lzbench_zstd_LDM_compress(char *inbuf, size_t insize, char *outbuf, size
 
 //         if (res < 0)
 //         {
-//             xzk_cctx_free(&ctx);
+//             zxc_cctx_free(&ctx);
 //             return 0; // Erreur ou buffer out trop petit
 //         }
 
@@ -1838,13 +1838,13 @@ int64_t lzbench_zstd_LDM_compress(char *inbuf, size_t insize, char *outbuf, size
 //         pos += chunk_len;
 //     }
 
-//     xzk_cctx_free(&ctx);
+//     zxc_cctx_free(&ctx);
 
 //     // Retourne la taille compressée totale
 //     return (int64_t)(dst - dst_start);
 // }
 
-// int64_t lzbench_xzk_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+// int64_t lzbench_zxc_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
 // {
 //     (void)codec_options;
 
@@ -1854,41 +1854,51 @@ int64_t lzbench_zstd_LDM_compress(char *inbuf, size_t insize, char *outbuf, size
 //     uint8_t *dst_start = dst;
 //     const uint8_t *dst_end = dst + outsize;
 
-//     // 1. Lecture/Vérification du File Header
-//     if (xzk_read_file_header(src, insize) != 0)
+//      zxc_cctx_t ctx;
+//     // Initialisation avec la taille de chunk par défaut
+//     if (zxc_cctx_init(&ctx, XZK_CHUNK_SIZE, 1, 5) != 0)
 //     {
+//         return 0; // Erreur d'allocation
+//     }
+
+//     // 1. Lecture/Vérification du File Header
+//     if (zxc_read_file_header(src, insize) != 0)
+//     {
+//         zxc_cctx_free(&ctx);
 //         return 0; // Header invalide ou taille insuffisante
 //     }
-//     src += XZK_FILE_HEADER_SIZE;
+//     src += ZXC_FILE_HEADER_SIZE;
 
 //     // 2. Boucle sur les blocs
 //     while (src < src_end)
 //     {
-//         xzk_block_header_t bh;
+//         zxc_block_header_t bh;
 //         // Lecture de l'en-tête de bloc
-//         if (xzk_read_block_header(src, src_end - src, &bh) != 0)
+//         if (zxc_read_block_header(src, src_end - src, &bh) != 0)
 //         {
+//             zxc_cctx_free(&ctx);
 //             return 0;
 //         }
 
 //         // Appel à la fonction statique interne de décompression
-//         // Note: 'ctx' est NULL car inutile en décompression dans votre implémentation actuelle
-//         int raw_written = decompress_chunk_wrapper(NULL, src, src_end - src, dst, dst_end - dst);
-
+//         int raw_written = decompress_chunk_wrapper(&ctx, src, src_end - src, dst, dst_end - dst);
 //         if (raw_written < 0)
 //         {
+//             zxc_cctx_free(&ctx);
 //             return 0; // Erreur de décompression
 //         }
 
 //         // Calcul de la taille consommée en entrée
-//         int has_crc = (bh.block_flags & XZK_BLOCK_FLAG_CHECKSUM);
-//         size_t header_overhead = XZK_BLOCK_HEADER_SIZE + (has_crc ? 4 : 0);
+//         int has_crc = (bh.block_flags & ZXC_BLOCK_FLAG_CHECKSUM);
+//         size_t header_overhead = ZXC_BLOCK_HEADER_SIZE + (has_crc ? 4 : 0);
 //         size_t block_total_size = header_overhead + bh.comp_size;
 
 //         src += block_total_size;
 //         dst += raw_written;
 //     }
 
+//     zxc_cctx_free(&ctx);
+       // Retourne la taille decompressée totale
 //     return (int64_t)(dst - dst_start);
 // }
 // #endif
