@@ -1826,7 +1826,7 @@ int64_t lzbench_zstd_LDM_compress(char *inbuf, size_t insize, char *outbuf, size
 //         size_t rem_cap = dst_end - dst;
 
 //         // Appel à la fonction statique interne existante
-//         int res = compress_chunk_wrapper(&ctx, src + pos, chunk_len, dst, rem_cap);
+//         int res = zxc_compress_chunk_wrapper(&ctx, src + pos, chunk_len, dst, rem_cap);
 
 //         if (res < 0)
 //         {
@@ -1881,7 +1881,7 @@ int64_t lzbench_zstd_LDM_compress(char *inbuf, size_t insize, char *outbuf, size
 //         }
 
 //         // Appel à la fonction statique interne de décompression
-//         int raw_written = decompress_chunk_wrapper(&ctx, src, src_end - src, dst, dst_end - dst);
+//         int raw_written = zxc_decompress_chunk_wrapper(&ctx, src, src_end - src, dst, dst_end - dst);
 //         if (raw_written < 0)
 //         {
 //             zxc_cctx_free(&ctx);
@@ -1898,7 +1898,7 @@ int64_t lzbench_zstd_LDM_compress(char *inbuf, size_t insize, char *outbuf, size
 //     }
 
 //     zxc_cctx_free(&ctx);
-       // Retourne la taille decompressée totale
+// Retourne la taille decompressée totale
 //     return (int64_t)(dst - dst_start);
 // }
 // #endif
