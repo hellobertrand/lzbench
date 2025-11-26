@@ -2054,31 +2054,24 @@ int64_t lzbench_zxc_compress(char *inbuf, size_t insize, char *outbuf,
     const uint8_t *dst_end = dst + outsize;
 
     zxc_cctx_t ctx;
-    // Initialisation avec la taille de chunk par défaut
-    if (zxc_cctx_init(&ctx, ZXC_CHUNK_SIZE, 1, 5) != 0)
-    {
-        return 0; // Erreur d'allocation
-    }
+    if (zxc_cctx_init(&ctx, ZXC_CHUNK_SIZE, 1, 7) != 0)
+        return 0;
 
-    // 1. Écriture du File Header
     int h_size = zxc_write_file_header(dst, dst_end - dst);
     if (h_size < 0)
     {
         zxc_cctx_free(&ctx);
-        return 0; // Buffer trop petit
+        return 0;
     }
     dst += h_size;
 
-    // 2. Boucle de compression
     size_t pos = 0;
     while (pos < insize)
     {
-        // Calcul de la taille du chunk courant
         size_t chunk_len =
             (insize - pos > ZXC_CHUNK_SIZE) ? ZXC_CHUNK_SIZE : (insize - pos);
         size_t rem_cap = dst_end - dst;
 
-        // Appel à la fonction statique interne existante
         int res =
             zxc_compress_chunk_wrapper(&ctx, src + pos, chunk_len, dst, rem_cap);
 
@@ -2110,32 +2103,25 @@ int64_t lzbench_zxc_decompress(char *inbuf, size_t insize, char *outbuf,
     const uint8_t *dst_end = dst + outsize;
 
     zxc_cctx_t ctx;
-    // Initialisation avec la taille de chunk par défaut
-    if (zxc_cctx_init(&ctx, ZXC_CHUNK_SIZE, 1, 5) != 0)
-    {
-        return 0; // Erreur d'allocation
-    }
+    if (zxc_cctx_init(&ctx, ZXC_CHUNK_SIZE, 0, 7) != 0)
+        return 0;
 
-    // 1. Lecture/Vérification du File Header
     if (zxc_read_file_header(src, insize) != 0)
     {
         zxc_cctx_free(&ctx);
-        return 0; // Header invalide ou taille insuffisante
+        return 0;
     }
     src += ZXC_FILE_HEADER_SIZE;
 
-    // 2. Boucle sur les blocs
     while (src < src_end)
     {
         zxc_block_header_t bh;
-        // Lecture de l'en-tête de bloc
         if (zxc_read_block_header(src, src_end - src, &bh) != 0)
         {
             zxc_cctx_free(&ctx);
             return 0;
         }
 
-        // Appel à la fonction statique interne de décompression
         int raw_written = zxc_decompress_chunk_wrapper(&ctx, src, src_end - src,
                                                        dst, dst_end - dst);
         if (raw_written < 0)
@@ -2144,7 +2130,6 @@ int64_t lzbench_zxc_decompress(char *inbuf, size_t insize, char *outbuf,
             return 0; // Erreur de décompression
         }
 
-        // Calcul de la taille consommée en entrée
         int has_crc = (bh.block_flags & ZXC_BLOCK_FLAG_CHECKSUM);
         size_t header_overhead = ZXC_BLOCK_HEADER_SIZE + (has_crc ? 4 : 0);
         size_t block_total_size = header_overhead + bh.comp_size;
