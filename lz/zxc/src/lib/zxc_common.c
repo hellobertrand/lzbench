@@ -6,7 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include "zxc.h"
+#include "../../include/zxc.h"
 #include "zxc_internal.h"
 
 /*
@@ -172,7 +172,7 @@ void zxc_cctx_free(zxc_cctx_t *ctx)
  */
 
 #define XXH_INLINE_ALL
-#include "xxhash.h"
+#include "../../include/xxhash.h"
 
 uint32_t zxc_checksum(const void *data, size_t len, uint32_t seed)
 {

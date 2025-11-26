@@ -6,7 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include "zxc.h"
+#include "../../include/zxc.h"
 #include "zxc_internal.h"
 
 // Force inlining for critical paths

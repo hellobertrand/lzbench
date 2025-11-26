@@ -11,12 +11,13 @@
 
 #include "codecs.h"
 
-#include <stdint.h>
-#include <stdio.h>   // printf
-#include <string.h>  // memcpy
 #include <algorithm> // std::max
+#include <stdint.h>
+#include <stdio.h>  // printf
+#include <string.h> // memcpy
 
-int64_t lzbench_memcpy(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_memcpy(char *inbuf, size_t insize, char *outbuf, size_t outsize,
+                       codec_options_t *codec_options)
 {
     memcpy(outbuf, inbuf, insize);
     return insize;
@@ -30,24 +31,26 @@ char *lzbench_memlz_init(size_t insize, size_t level, size_t)
     return (char *)malloc(sizeof(memlz_state));
 }
 
-void lzbench_memlz_deinit(char *workmem)
-{
-    free(workmem);
-}
+void lzbench_memlz_deinit(char *workmem) { free(workmem); }
 
-int64_t lzbench_memlz_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_memlz_compress(char *inbuf, size_t insize, char *outbuf,
+                               size_t outsize, codec_options_t *codec_options)
 {
     if (!codec_options->work_mem)
         return 0;
 
     memlz_reset((memlz_state *)codec_options->work_mem);
-    return memlz_stream_compress(outbuf, inbuf, insize, (memlz_state *)codec_options->work_mem);
+    return memlz_stream_compress(outbuf, inbuf, insize,
+                                 (memlz_state *)codec_options->work_mem);
 }
 
-int64_t lzbench_memlz_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_memlz_decompress(char *inbuf, size_t insize, char *outbuf,
+                                 size_t outsize,
+                                 codec_options_t *codec_options)
 {
     memlz_reset((memlz_state *)codec_options->work_mem);
-    return (int64_t)memlz_stream_decompress(outbuf, inbuf, (memlz_state *)codec_options->work_mem);
+    return (int64_t)memlz_stream_decompress(
+        outbuf, inbuf, (memlz_state *)codec_options->work_mem);
 }
 
 #endif // BENCH_REMOVE_MEMLZ
@@ -60,22 +63,25 @@ char *lzbench_brieflz_init(size_t insize, size_t level, size_t)
     return (char *)malloc(blz_workmem_size_level(insize, level));
 }
 
-void lzbench_brieflz_deinit(char *workmem)
-{
-    free(workmem);
-}
+void lzbench_brieflz_deinit(char *workmem) { free(workmem); }
 
-int64_t lzbench_brieflz_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_brieflz_compress(char *inbuf, size_t insize, char *outbuf,
+                                 size_t outsize,
+                                 codec_options_t *codec_options)
 {
     if (!codec_options->work_mem)
         return 0;
 
-    int64_t res = blz_pack_level(inbuf, outbuf, insize, (void *)codec_options->work_mem, codec_options->level);
+    int64_t res =
+        blz_pack_level(inbuf, outbuf, insize, (void *)codec_options->work_mem,
+                       codec_options->level);
 
     return res;
 }
 
-int64_t lzbench_brieflz_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_brieflz_decompress(char *inbuf, size_t insize, char *outbuf,
+                                   size_t outsize,
+                                   codec_options_t *codec_options)
 {
     return blz_depack(inbuf, outbuf, outsize);
 }
@@ -83,22 +89,35 @@ int64_t lzbench_brieflz_decompress(char *inbuf, size_t insize, char *outbuf, siz
 #endif // BENCH_REMOVE_BRIEFLZ
 
 #ifndef BENCH_REMOVE_BROTLI
-#include "brotli/encode.h"
 #include "brotli/decode.h"
+#include "brotli/encode.h"
 
-int64_t lzbench_brotli_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_brotli_compress(char *inbuf, size_t insize, char *outbuf,
+                                size_t outsize,
+                                codec_options_t *codec_options)
 {
     int windowLog = codec_options->additional_param;
     if (!windowLog)
-        windowLog = BROTLI_DEFAULT_WINDOW; // sliding window size. Range is 10 to 24.
+        windowLog =
+            BROTLI_DEFAULT_WINDOW; // sliding window size. Range is 10 to 24.
 
     size_t actual_osize = outsize;
-    return BrotliEncoderCompress(codec_options->level, windowLog, BROTLI_DEFAULT_MODE, insize, (const uint8_t *)inbuf, &actual_osize, (uint8_t *)outbuf) == 0 ? 0 : actual_osize;
+    return BrotliEncoderCompress(
+               codec_options->level, windowLog, BROTLI_DEFAULT_MODE, insize,
+               (const uint8_t *)inbuf, &actual_osize, (uint8_t *)outbuf) == 0
+               ? 0
+               : actual_osize;
 }
-int64_t lzbench_brotli_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_brotli_decompress(char *inbuf, size_t insize, char *outbuf,
+                                  size_t outsize,
+                                  codec_options_t *codec_options)
 {
     size_t actual_osize = outsize;
-    return BrotliDecoderDecompress(insize, (const uint8_t *)inbuf, &actual_osize, (uint8_t *)outbuf) == BROTLI_DECODER_RESULT_ERROR ? 0 : actual_osize;
+    return BrotliDecoderDecompress(insize, (const uint8_t *)inbuf, &actual_osize,
+                                   (uint8_t *)outbuf) ==
+                   BROTLI_DECODER_RESULT_ERROR
+               ? 0
+               : actual_osize;
 }
 
 #endif // BENCH_REMOVE_BROTLI
@@ -106,12 +125,16 @@ int64_t lzbench_brotli_decompress(char *inbuf, size_t insize, char *outbuf, size
 #ifndef BENCH_REMOVE_CRUSH
 #include "lz/crush/crush.hpp"
 
-int64_t lzbench_crush_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_crush_compress(char *inbuf, size_t insize, char *outbuf,
+                               size_t outsize, codec_options_t *codec_options)
 {
-    return crush::compress(codec_options->level, (uint8_t *)inbuf, insize, (uint8_t *)outbuf);
+    return crush::compress(codec_options->level, (uint8_t *)inbuf, insize,
+                           (uint8_t *)outbuf);
 }
 
-int64_t lzbench_crush_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_crush_decompress(char *inbuf, size_t insize, char *outbuf,
+                                 size_t outsize,
+                                 codec_options_t *codec_options)
 {
     return crush::decompress((uint8_t *)inbuf, (uint8_t *)outbuf, outsize);
 }
@@ -124,12 +147,16 @@ extern "C"
 #include "lz/fastlz/fastlz.h"
 }
 
-int64_t lzbench_fastlz_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_fastlz_compress(char *inbuf, size_t insize, char *outbuf,
+                                size_t outsize,
+                                codec_options_t *codec_options)
 {
     return fastlz_compress_level(codec_options->level, inbuf, insize, outbuf);
 }
 
-int64_t lzbench_fastlz_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_fastlz_decompress(char *inbuf, size_t insize, char *outbuf,
+                                  size_t outsize,
+                                  codec_options_t *codec_options)
 {
     return fastlz_decompress(inbuf, insize, outbuf, outsize);
 }
@@ -139,17 +166,23 @@ int64_t lzbench_fastlz_decompress(char *inbuf, size_t insize, char *outbuf, size
 #ifndef BENCH_REMOVE_FASTLZMA2
 #include "lz/fast-lzma2/fast-lzma2.h"
 
-int64_t lzbench_fastlzma2_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_fastlzma2_compress(char *inbuf, size_t insize, char *outbuf,
+                                   size_t outsize,
+                                   codec_options_t *codec_options)
 {
-    size_t ret = FL2_compressMt(outbuf, outsize, inbuf, insize, codec_options->level, codec_options->threads);
+    size_t ret = FL2_compressMt(outbuf, outsize, inbuf, insize,
+                                codec_options->level, codec_options->threads);
     if (FL2_isError(ret))
         return 0;
     return ret;
 }
 
-int64_t lzbench_fastlzma2_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_fastlzma2_decompress(char *inbuf, size_t insize, char *outbuf,
+                                     size_t outsize,
+                                     codec_options_t *codec_options)
 {
-    size_t ret = FL2_decompressMt(outbuf, outsize, inbuf, insize, codec_options->threads);
+    size_t ret =
+        FL2_decompressMt(outbuf, outsize, inbuf, insize, codec_options->threads);
     if (FL2_isError(ret))
         return 0;
     return ret;
@@ -157,14 +190,15 @@ int64_t lzbench_fastlzma2_decompress(char *inbuf, size_t insize, char *outbuf, s
 #endif // BENCH_REMOVE_FASTLZMA2
 
 #ifndef BENCH_REMOVE_KANZI
-#include "misc/kanzi-cpp/src/types.hpp"
-#include "misc/kanzi-cpp/src/util.hpp"
 #include "misc/kanzi-cpp/src/InputStream.hpp"
 #include "misc/kanzi-cpp/src/OutputStream.hpp"
 #include "misc/kanzi-cpp/src/io/CompressedInputStream.hpp"
 #include "misc/kanzi-cpp/src/io/CompressedOutputStream.hpp"
+#include "misc/kanzi-cpp/src/types.hpp"
+#include "misc/kanzi-cpp/src/util.hpp"
 
-int64_t lzbench_kanzi_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_kanzi_compress(char *inbuf, size_t insize, char *outbuf,
+                               size_t outsize, codec_options_t *codec_options)
 {
     std::string entropy;
     std::string transform;
@@ -228,13 +262,16 @@ int64_t lzbench_kanzi_compress(char *inbuf, size_t insize, char *outbuf, size_t 
 
     ostreambuf<char> buf(outbuf, outsize);
     std::iostream os(&buf);
-    kanzi::CompressedOutputStream cos(os, codec_options->threads, entropy, transform, szBlock);
+    kanzi::CompressedOutputStream cos(os, codec_options->threads, entropy,
+                                      transform, szBlock);
     cos.write(inbuf, insize);
     cos.close();
     return cos.getWritten();
 }
 
-int64_t lzbench_kanzi_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_kanzi_decompress(char *inbuf, size_t insize, char *outbuf,
+                                 size_t outsize,
+                                 codec_options_t *codec_options)
 {
     istreambuf<char> buf(inbuf, insize);
     std::iostream is(&buf);
@@ -247,22 +284,30 @@ int64_t lzbench_kanzi_decompress(char *inbuf, size_t insize, char *outbuf, size_
 
 #ifndef BENCH_REMOVE_LIBDEFLATE
 #include "lz/libdeflate/libdeflate.h"
-int64_t lzbench_libdeflate_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_libdeflate_compress(char *inbuf, size_t insize, char *outbuf,
+                                    size_t outsize,
+                                    codec_options_t *codec_options)
 {
-    struct libdeflate_compressor *compressor = libdeflate_alloc_compressor(codec_options->level);
+    struct libdeflate_compressor *compressor =
+        libdeflate_alloc_compressor(codec_options->level);
     if (!compressor)
         return 0;
-    int64_t res = libdeflate_deflate_compress(compressor, inbuf, insize, outbuf, outsize);
+    int64_t res =
+        libdeflate_deflate_compress(compressor, inbuf, insize, outbuf, outsize);
     libdeflate_free_compressor(compressor);
     return res;
 }
-int64_t lzbench_libdeflate_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_libdeflate_decompress(char *inbuf, size_t insize, char *outbuf,
+                                      size_t outsize,
+                                      codec_options_t *codec_options)
 {
-    struct libdeflate_decompressor *decompressor = libdeflate_alloc_decompressor();
+    struct libdeflate_decompressor *decompressor =
+        libdeflate_alloc_decompressor();
     if (!decompressor)
         return 0;
     size_t res = 0;
-    if (libdeflate_deflate_decompress(decompressor, inbuf, insize, outbuf, outsize, &res) != LIBDEFLATE_SUCCESS)
+    if (libdeflate_deflate_decompress(decompressor, inbuf, insize, outbuf,
+                                      outsize, &res) != LIBDEFLATE_SUCCESS)
     {
         return 0;
     }
@@ -274,12 +319,16 @@ int64_t lzbench_libdeflate_decompress(char *inbuf, size_t insize, char *outbuf, 
 #include "lz/lizard/lizard_compress.h"
 #include "lz/lizard/lizard_decompress.h"
 
-int64_t lzbench_lizard_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lizard_compress(char *inbuf, size_t insize, char *outbuf,
+                                size_t outsize,
+                                codec_options_t *codec_options)
 {
     return Lizard_compress(inbuf, outbuf, insize, outsize, codec_options->level);
 }
 
-int64_t lzbench_lizard_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lizard_decompress(char *inbuf, size_t insize, char *outbuf,
+                                  size_t outsize,
+                                  codec_options_t *codec_options)
 {
     return Lizard_decompress_safe(inbuf, outbuf, insize, outsize);
 }
@@ -290,22 +339,28 @@ int64_t lzbench_lizard_decompress(char *inbuf, size_t insize, char *outbuf, size
 #include "lz/lz4/lib/lz4.h"
 #include "lz/lz4/lib/lz4hc.h"
 
-int64_t lzbench_lz4_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lz4_compress(char *inbuf, size_t insize, char *outbuf,
+                             size_t outsize, codec_options_t *codec_options)
 {
     return LZ4_compress_default(inbuf, outbuf, insize, outsize);
 }
 
-int64_t lzbench_lz4fast_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lz4fast_compress(char *inbuf, size_t insize, char *outbuf,
+                                 size_t outsize,
+                                 codec_options_t *codec_options)
 {
-    return LZ4_compress_fast(inbuf, outbuf, insize, outsize, codec_options->level);
+    return LZ4_compress_fast(inbuf, outbuf, insize, outsize,
+                             codec_options->level);
 }
 
-int64_t lzbench_lz4hc_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lz4hc_compress(char *inbuf, size_t insize, char *outbuf,
+                               size_t outsize, codec_options_t *codec_options)
 {
     return LZ4_compress_HC(inbuf, outbuf, insize, outsize, codec_options->level);
 }
 
-int64_t lzbench_lz4_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lz4_decompress(char *inbuf, size_t insize, char *outbuf,
+                               size_t outsize, codec_options_t *codec_options)
 {
     return LZ4_decompress_safe(inbuf, outbuf, insize, outsize);
 }
@@ -315,14 +370,17 @@ int64_t lzbench_lz4_decompress(char *inbuf, size_t insize, char *outbuf, size_t 
 #ifndef BENCH_REMOVE_LZAV
 #include "lz/lzav/lzav.h"
 
-int64_t lzbench_lzav_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzav_compress(char *inbuf, size_t insize, char *outbuf,
+                              size_t outsize, codec_options_t *codec_options)
 {
     if (codec_options->level == 1)
         return lzav_compress_default(inbuf, outbuf, insize, outsize);
     return lzav_compress_hi(inbuf, outbuf, insize, outsize);
 }
 
-int64_t lzbench_lzav_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzav_decompress(char *inbuf, size_t insize, char *outbuf,
+                                size_t outsize,
+                                codec_options_t *codec_options)
 {
     return lzav_decompress(inbuf, outbuf, insize, outsize);
 }
@@ -335,14 +393,16 @@ extern "C"
 #include "lz/lzf/lzf.h"
 }
 
-int64_t lzbench_lzf_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzf_compress(char *inbuf, size_t insize, char *outbuf,
+                             size_t outsize, codec_options_t *codec_options)
 {
     if (codec_options->level == 0)
         return lzf_compress(inbuf, insize, outbuf, outsize);
     return lzf_compress_very(inbuf, insize, outbuf, outsize);
 }
 
-int64_t lzbench_lzf_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzf_decompress(char *inbuf, size_t insize, char *outbuf,
+                               size_t outsize, codec_options_t *codec_options)
 {
     return lzf_decompress(inbuf, insize, outbuf, outsize);
 }
@@ -357,22 +417,25 @@ extern "C"
 
 char *lzbench_lzfse_init(size_t insize, size_t level, size_t)
 {
-    return (char *)malloc(std::max(lzfse_encode_scratch_size(), lzfse_decode_scratch_size()));
+    return (char *)malloc(
+        std::max(lzfse_encode_scratch_size(), lzfse_decode_scratch_size()));
 }
 
-void lzbench_lzfse_deinit(char *workmem)
+void lzbench_lzfse_deinit(char *workmem) { free(workmem); }
+
+int64_t lzbench_lzfse_compress(char *inbuf, size_t insize, char *outbuf,
+                               size_t outsize, codec_options_t *codec_options)
 {
-    free(workmem);
+    return lzfse_encode_buffer((uint8_t *)outbuf, outsize, (uint8_t *)inbuf,
+                               insize, codec_options->work_mem);
 }
 
-int64_t lzbench_lzfse_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzfse_decompress(char *inbuf, size_t insize, char *outbuf,
+                                 size_t outsize,
+                                 codec_options_t *codec_options)
 {
-    return lzfse_encode_buffer((uint8_t *)outbuf, outsize, (uint8_t *)inbuf, insize, codec_options->work_mem);
-}
-
-int64_t lzbench_lzfse_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
-{
-    return lzfse_decode_buffer((uint8_t *)outbuf, outsize, (uint8_t *)inbuf, insize, codec_options->work_mem);
+    return lzfse_decode_buffer((uint8_t *)outbuf, outsize, (uint8_t *)inbuf,
+                               insize, codec_options->work_mem);
 }
 
 #endif
@@ -385,22 +448,26 @@ extern "C"
 
 char *lzbench_lzvn_init(size_t insize, size_t level, size_t)
 {
-    return (char *)malloc(std::max(lzvn_encode_scratch_size(), lzvn_decode_scratch_size()));
+    return (char *)malloc(
+        std::max(lzvn_encode_scratch_size(), lzvn_decode_scratch_size()));
 }
 
-void lzbench_lzvn_deinit(char *workmem)
+void lzbench_lzvn_deinit(char *workmem) { free(workmem); }
+
+int64_t lzbench_lzvn_compress(char *inbuf, size_t insize, char *outbuf,
+                              size_t outsize, codec_options_t *codec_options)
 {
-    free(workmem);
+    return lzvn_encode_buffer((uint8_t *)outbuf, outsize, (uint8_t *)inbuf,
+                              insize, codec_options->work_mem);
 }
 
-int64_t lzbench_lzvn_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzvn_decompress(char *inbuf, size_t insize, char *outbuf,
+                                size_t outsize,
+                                codec_options_t *codec_options)
 {
-    return lzvn_encode_buffer((uint8_t *)outbuf, outsize, (uint8_t *)inbuf, insize, codec_options->work_mem);
-}
-
-int64_t lzbench_lzvn_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
-{
-    return lzvn_decode_buffer_scratch((uint8_t *)outbuf, outsize, (uint8_t *)inbuf, insize, codec_options->work_mem);
+    return lzvn_decode_buffer_scratch((uint8_t *)outbuf, outsize,
+                                      (uint8_t *)inbuf, insize,
+                                      codec_options->work_mem);
 }
 
 #endif
@@ -408,19 +475,23 @@ int64_t lzbench_lzvn_decompress(char *inbuf, size_t insize, char *outbuf, size_t
 #ifndef BENCH_REMOVE_LZG
 #include "lz/liblzg/lzg.h"
 
-int64_t lzbench_lzg_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzg_compress(char *inbuf, size_t insize, char *outbuf,
+                             size_t outsize, codec_options_t *codec_options)
 {
     lzg_encoder_config_t cfg;
     cfg.level = codec_options->level;
     cfg.fast = LZG_TRUE;
     cfg.progressfun = NULL;
     cfg.userdata = NULL;
-    return LZG_Encode((const unsigned char *)inbuf, insize, (unsigned char *)outbuf, outsize, &cfg);
+    return LZG_Encode((const unsigned char *)inbuf, insize,
+                      (unsigned char *)outbuf, outsize, &cfg);
 }
 
-int64_t lzbench_lzg_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzg_decompress(char *inbuf, size_t insize, char *outbuf,
+                               size_t outsize, codec_options_t *codec_options)
 {
-    return LZG_Decode((const unsigned char *)inbuf, insize, (unsigned char *)outbuf, outsize);
+    return LZG_Decode((const unsigned char *)inbuf, insize,
+                      (unsigned char *)outbuf, outsize);
 }
 
 #endif
@@ -429,7 +500,8 @@ int64_t lzbench_lzg_decompress(char *inbuf, size_t insize, char *outbuf, size_t 
 #include "lz/lzham/include/lzham.h"
 #include <memory.h>
 
-int64_t lzbench_lzham_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzham_compress(char *inbuf, size_t insize, char *outbuf,
+                               size_t outsize, codec_options_t *codec_options)
 {
     int dict_size_log = codec_options->additional_param;
     lzham_compress_params comp_params;
@@ -437,13 +509,17 @@ int64_t lzbench_lzham_compress(char *inbuf, size_t insize, char *outbuf, size_t 
     memset(&comp_params, 0, sizeof(comp_params));
     comp_params.m_struct_size = sizeof(lzham_compress_params);
     comp_params.m_dict_size_log2 = dict_size_log ? dict_size_log : 26;
-    comp_params.m_max_helper_threads = codec_options->threads > 1 ? codec_options->threads : 0;
+    comp_params.m_max_helper_threads =
+        codec_options->threads > 1 ? codec_options->threads : 0;
     comp_params.m_level = (lzham_compress_level)codec_options->level;
 
     lzham_compress_status_t comp_status;
     lzham_uint32 comp_adler32 = 0;
 
-    if ((comp_status = lzham_compress_memory(&comp_params, (uint8_t *)outbuf, &outsize, (const lzham_uint8 *)inbuf, insize, &comp_adler32)) != LZHAM_COMP_STATUS_SUCCESS)
+    if ((comp_status = lzham_compress_memory(&comp_params, (uint8_t *)outbuf,
+                                             &outsize, (const lzham_uint8 *)inbuf,
+                                             insize, &comp_adler32)) !=
+        LZHAM_COMP_STATUS_SUCCESS)
     {
         printf("Compression test failed with status %i!\n", comp_status);
         return 0;
@@ -452,7 +528,9 @@ int64_t lzbench_lzham_compress(char *inbuf, size_t insize, char *outbuf, size_t 
     return outsize;
 }
 
-int64_t lzbench_lzham_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzham_decompress(char *inbuf, size_t insize, char *outbuf,
+                                 size_t outsize,
+                                 codec_options_t *codec_options)
 {
     int dict_size_log = codec_options->additional_param;
     lzham_uint32 comp_adler32 = 0;
@@ -462,7 +540,8 @@ int64_t lzbench_lzham_decompress(char *inbuf, size_t insize, char *outbuf, size_
     decomp_params.m_struct_size = sizeof(decomp_params);
     decomp_params.m_dict_size_log2 = dict_size_log ? dict_size_log : 26;
 
-    lzham_decompress_memory(&decomp_params, (uint8_t *)outbuf, &outsize, (const lzham_uint8 *)inbuf, insize, &comp_adler32);
+    lzham_decompress_memory(&decomp_params, (uint8_t *)outbuf, &outsize,
+                            (const lzham_uint8 *)inbuf, insize, &comp_adler32);
     return outsize;
 }
 
@@ -471,7 +550,8 @@ int64_t lzbench_lzham_decompress(char *inbuf, size_t insize, char *outbuf, size_
 #ifndef BENCH_REMOVE_LZLIB
 #include "lz/lzlib/lzlib.h"
 
-int64_t lzbench_lzlib_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzlib_compress(char *inbuf, size_t insize, char *outbuf,
+                               size_t outsize, codec_options_t *codec_options)
 {
     struct Lzma_options
     {
@@ -479,20 +559,20 @@ int64_t lzbench_lzlib_compress(char *inbuf, size_t insize, char *outbuf, size_t 
         int match_len_limit; /* 5 .. 273 */
     };
 
-    const struct Lzma_options option_mapping[10] = {
-        {65535, 16},     /* -0 */
-        {1 << 20, 5},    /* -1 */
-        {3 << 19, 6},    /* -2 */
-        {1 << 21, 8},    /* -3 */
-        {3 << 20, 12},   /* -4 */
-        {1 << 22, 20},   /* -5 */
-        {1 << 23, 36},   /* -6 */
-        {1 << 24, 68},   /* -7 */
-        {3 << 23, 132},  /* -8 */
-        {1 << 25, 273}}; /* -9 */
+    const struct Lzma_options option_mapping[10] = {{65535, 16},     /* -0 */
+                                                    {1 << 20, 5},    /* -1 */
+                                                    {3 << 19, 6},    /* -2 */
+                                                    {1 << 21, 8},    /* -3 */
+                                                    {3 << 20, 12},   /* -4 */
+                                                    {1 << 22, 20},   /* -5 */
+                                                    {1 << 23, 36},   /* -6 */
+                                                    {1 << 24, 68},   /* -7 */
+                                                    {3 << 23, 132},  /* -8 */
+                                                    {1 << 25, 273}}; /* -9 */
 
     struct LZ_Encoder *encoder;
-    const int match_len_limit = option_mapping[codec_options->level].match_len_limit;
+    const int match_len_limit =
+        option_mapping[codec_options->level].match_len_limit;
     const unsigned long long member_size = 0x7FFFFFFFFFFFFFFFULL; /* INT64_MAX */
     int new_pos = 0;
     int written = 0;
@@ -519,7 +599,8 @@ int64_t lzbench_lzlib_compress(char *inbuf, size_t insize, char *outbuf, size_t 
         {
             if (written < insize)
             {
-                const int wr = LZ_compress_write(encoder, buf + written, insize - written);
+                const int wr =
+                    LZ_compress_write(encoder, buf + written, insize - written);
                 if (wr < 0)
                 {
                     error = true;
@@ -549,7 +630,9 @@ int64_t lzbench_lzlib_compress(char *inbuf, size_t insize, char *outbuf, size_t 
     return new_pos;
 }
 
-int64_t lzbench_lzlib_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzlib_decompress(char *inbuf, size_t insize, char *outbuf,
+                                 size_t outsize,
+                                 codec_options_t *codec_options)
 {
     struct LZ_Decoder *const decoder = LZ_decompress_open();
     uint8_t *new_data = (uint8_t *)outbuf;
@@ -572,8 +655,10 @@ int64_t lzbench_lzlib_decompress(char *inbuf, size_t insize, char *outbuf, size_
         {
             if (written < insize)
             {
-                const int wr = LZ_decompress_write(decoder, data + written, insize - written);
-                //   printf("write=%d written=%d left=%d\n", wr, written, insize - written);
+                const int wr =
+                    LZ_decompress_write(decoder, data + written, insize - written);
+                //   printf("write=%d written=%d left=%d\n", wr, written, insize -
+                //   written);
                 if (wr < 0)
                 {
                     error = true;
@@ -584,7 +669,8 @@ int64_t lzbench_lzlib_decompress(char *inbuf, size_t insize, char *outbuf, size_
             if (written >= insize)
                 LZ_decompress_finish(decoder);
         }
-        rd = LZ_decompress_read(decoder, new_data + new_pos, new_data_size - new_pos);
+        rd = LZ_decompress_read(decoder, new_data + new_pos,
+                                new_data_size - new_pos);
         //  printf("read=%d new_pos=%d\n", rd, new_pos);
         if (rd < 0)
         {
@@ -606,13 +692,14 @@ int64_t lzbench_lzlib_decompress(char *inbuf, size_t insize, char *outbuf, size_
 
 #ifndef BENCH_REMOVE_LZMA
 
-#include <string.h>
 #include "misc/7-zip/Alloc.h"
 #include "misc/7-zip/Lzma2Dec.h"
 #include "misc/7-zip/Lzma2DecMt.h"
 #include "misc/7-zip/Lzma2Enc.h"
+#include <string.h>
 
-int64_t lzbench_lzma_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzma_compress(char *inbuf, size_t insize, char *outbuf,
+                              size_t outsize, codec_options_t *codec_options)
 {
     CLzma2EncProps props;
     CLzma2EncHandle enc;
@@ -637,7 +724,8 @@ int64_t lzbench_lzma_compress(char *inbuf, size_t insize, char *outbuf, size_t o
     outbuf[0] = Lzma2Enc_WriteProperties(enc);
     ;
 
-    res = Lzma2Enc_Encode2(enc, NULL, (Byte *)outbuf + 1, &out_len, NULL, (const Byte *)inbuf, insize, NULL);
+    res = Lzma2Enc_Encode2(enc, NULL, (Byte *)outbuf + 1, &out_len, NULL,
+                           (const Byte *)inbuf, insize, NULL);
     Lzma2Enc_Destroy(enc);
     if (res != SZ_OK)
         return -3;
@@ -690,7 +778,9 @@ static size_t MyWrite(void *p, const void *buf, size_t size)
     return toWrite;
 }
 
-int64_t lzbench_lzma_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzma_decompress(char *inbuf, size_t insize, char *outbuf,
+                                size_t outsize,
+                                codec_options_t *codec_options)
 {
     CLzma2DecMtHandle dec_handle;
     CLzma2DecMtProps props;
@@ -710,7 +800,8 @@ int64_t lzbench_lzma_decompress(char *inbuf, size_t insize, char *outbuf, size_t
     inStream.size = insize - 1;
 
     CBufOutStream outStream;
-    outStream.vt.Write = (size_t (*)(ISeqOutStreamPtr, const void *, size_t))MyWrite;
+    outStream.vt.Write =
+        (size_t (*)(ISeqOutStreamPtr, const void *, size_t))MyWrite;
     outStream.data = (Byte *)outbuf;
     outStream.size = outsize;
 
@@ -721,17 +812,9 @@ int64_t lzbench_lzma_decompress(char *inbuf, size_t insize, char *outbuf, size_t
     Lzma2DecMtProps_Init(&props);
     props.numThreads = codec_options->threads;
 
-    res = Lzma2DecMt_Decode(
-        dec_handle,
-        prop_byte,
-        &props,
-        &outStream.vt,
-        &out_size_defined,
-        1,
-        &inStream.vt,
-        &in_processed,
-        &is_mt,
-        NULL);
+    res = Lzma2DecMt_Decode(dec_handle, prop_byte, &props, &outStream.vt,
+                            &out_size_defined, 1, &inStream.vt, &in_processed,
+                            &is_mt, NULL);
 
     Lzma2DecMt_Destroy(dec_handle);
     if (res != SZ_OK)
@@ -760,12 +843,10 @@ char *lzbench_lzo_init(size_t, size_t, size_t)
     return (char *)malloc(LZO1B_999_MEM_COMPRESS);
 }
 
-void lzbench_lzo_deinit(char *workmem)
-{
-    free(workmem);
-}
+void lzbench_lzo_deinit(char *workmem) { free(workmem); }
 
-int64_t lzbench_lzo1_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzo1_compress(char *inbuf, size_t insize, char *outbuf,
+                              size_t outsize, codec_options_t *codec_options)
 {
     lzo_uint lzo_complen = 0;
     int res;
@@ -773,9 +854,11 @@ int64_t lzbench_lzo1_compress(char *inbuf, size_t insize, char *outbuf, size_t o
         return 0;
 
     if (codec_options->level == 99)
-        res = lzo1_99_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)codec_options->work_mem);
+        res = lzo1_99_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                               &lzo_complen, (void *)codec_options->work_mem);
     else
-        res = lzo1_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)codec_options->work_mem);
+        res = lzo1_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                            &lzo_complen, (void *)codec_options->work_mem);
 
     if (res != LZO_E_OK)
         return 0;
@@ -783,17 +866,21 @@ int64_t lzbench_lzo1_compress(char *inbuf, size_t insize, char *outbuf, size_t o
     return lzo_complen;
 }
 
-int64_t lzbench_lzo1_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzo1_decompress(char *inbuf, size_t insize, char *outbuf,
+                                size_t outsize,
+                                codec_options_t *codec_options)
 {
     lzo_uint decomplen = 0;
 
-    if (lzo1_decompress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &decomplen, NULL) != LZO_E_OK)
+    if (lzo1_decompress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &decomplen,
+                        NULL) != LZO_E_OK)
         return 0;
 
     return decomplen;
 }
 
-int64_t lzbench_lzo1a_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzo1a_compress(char *inbuf, size_t insize, char *outbuf,
+                               size_t outsize, codec_options_t *codec_options)
 {
     lzo_uint lzo_complen = 0;
     int res;
@@ -802,9 +889,11 @@ int64_t lzbench_lzo1a_compress(char *inbuf, size_t insize, char *outbuf, size_t 
         return 0;
 
     if (codec_options->level == 99)
-        res = lzo1a_99_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)codec_options->work_mem);
+        res = lzo1a_99_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                                &lzo_complen, (void *)codec_options->work_mem);
     else
-        res = lzo1a_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)codec_options->work_mem);
+        res = lzo1a_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                             &lzo_complen, (void *)codec_options->work_mem);
 
     if (res != LZO_E_OK)
         return 0;
@@ -812,17 +901,21 @@ int64_t lzbench_lzo1a_compress(char *inbuf, size_t insize, char *outbuf, size_t 
     return lzo_complen;
 }
 
-int64_t lzbench_lzo1a_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzo1a_decompress(char *inbuf, size_t insize, char *outbuf,
+                                 size_t outsize,
+                                 codec_options_t *codec_options)
 {
     lzo_uint decomplen = 0;
 
-    if (lzo1a_decompress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &decomplen, NULL) != LZO_E_OK)
+    if (lzo1a_decompress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &decomplen,
+                         NULL) != LZO_E_OK)
         return 0;
 
     return decomplen;
 }
 
-int64_t lzbench_lzo1b_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzo1b_compress(char *inbuf, size_t insize, char *outbuf,
+                               size_t outsize, codec_options_t *codec_options)
 {
     lzo_uint lzo_complen = 0;
     int res;
@@ -834,37 +927,48 @@ int64_t lzbench_lzo1b_compress(char *inbuf, size_t insize, char *outbuf, size_t 
     {
     default:
     case 1:
-        res = lzo1b_1_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1b_1_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                               &lzo_complen, (void *)workmem);
         break;
     case 2:
-        res = lzo1b_2_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1b_2_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                               &lzo_complen, (void *)workmem);
         break;
     case 3:
-        res = lzo1b_3_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1b_3_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                               &lzo_complen, (void *)workmem);
         break;
     case 4:
-        res = lzo1b_4_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1b_4_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                               &lzo_complen, (void *)workmem);
         break;
     case 5:
-        res = lzo1b_5_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1b_5_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                               &lzo_complen, (void *)workmem);
         break;
     case 6:
-        res = lzo1b_6_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1b_6_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                               &lzo_complen, (void *)workmem);
         break;
     case 7:
-        res = lzo1b_7_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1b_7_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                               &lzo_complen, (void *)workmem);
         break;
     case 8:
-        res = lzo1b_8_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1b_8_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                               &lzo_complen, (void *)workmem);
         break;
     case 9:
-        res = lzo1b_9_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1b_9_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                               &lzo_complen, (void *)workmem);
         break;
     case 99:
-        res = lzo1b_99_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1b_99_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                                &lzo_complen, (void *)workmem);
         break;
     case 999:
-        res = lzo1b_999_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1b_999_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                                 &lzo_complen, (void *)workmem);
         break;
     }
 
@@ -874,17 +978,21 @@ int64_t lzbench_lzo1b_compress(char *inbuf, size_t insize, char *outbuf, size_t 
     return lzo_complen;
 }
 
-int64_t lzbench_lzo1b_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzo1b_decompress(char *inbuf, size_t insize, char *outbuf,
+                                 size_t outsize,
+                                 codec_options_t *codec_options)
 {
     lzo_uint decomplen = 0;
 
-    if (lzo1b_decompress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &decomplen, NULL) != LZO_E_OK)
+    if (lzo1b_decompress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &decomplen,
+                         NULL) != LZO_E_OK)
         return 0;
 
     return decomplen;
 }
 
-int64_t lzbench_lzo1c_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzo1c_compress(char *inbuf, size_t insize, char *outbuf,
+                               size_t outsize, codec_options_t *codec_options)
 {
     lzo_uint lzo_complen = 0;
     int res;
@@ -896,37 +1004,48 @@ int64_t lzbench_lzo1c_compress(char *inbuf, size_t insize, char *outbuf, size_t 
     {
     default:
     case 1:
-        res = lzo1c_1_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1c_1_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                               &lzo_complen, (void *)workmem);
         break;
     case 2:
-        res = lzo1c_2_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1c_2_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                               &lzo_complen, (void *)workmem);
         break;
     case 3:
-        res = lzo1c_3_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1c_3_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                               &lzo_complen, (void *)workmem);
         break;
     case 4:
-        res = lzo1c_4_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1c_4_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                               &lzo_complen, (void *)workmem);
         break;
     case 5:
-        res = lzo1c_5_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1c_5_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                               &lzo_complen, (void *)workmem);
         break;
     case 6:
-        res = lzo1c_6_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1c_6_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                               &lzo_complen, (void *)workmem);
         break;
     case 7:
-        res = lzo1c_7_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1c_7_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                               &lzo_complen, (void *)workmem);
         break;
     case 8:
-        res = lzo1c_8_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1c_8_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                               &lzo_complen, (void *)workmem);
         break;
     case 9:
-        res = lzo1c_9_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1c_9_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                               &lzo_complen, (void *)workmem);
         break;
     case 99:
-        res = lzo1c_99_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1c_99_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                                &lzo_complen, (void *)workmem);
         break;
     case 999:
-        res = lzo1c_999_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1c_999_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                                 &lzo_complen, (void *)workmem);
         break;
     }
 
@@ -936,17 +1055,21 @@ int64_t lzbench_lzo1c_compress(char *inbuf, size_t insize, char *outbuf, size_t 
     return lzo_complen;
 }
 
-int64_t lzbench_lzo1c_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzo1c_decompress(char *inbuf, size_t insize, char *outbuf,
+                                 size_t outsize,
+                                 codec_options_t *codec_options)
 {
     lzo_uint decomplen = 0;
 
-    if (lzo1c_decompress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &decomplen, NULL) != LZO_E_OK)
+    if (lzo1c_decompress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &decomplen,
+                         NULL) != LZO_E_OK)
         return 0;
 
     return decomplen;
 }
 
-int64_t lzbench_lzo1f_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzo1f_compress(char *inbuf, size_t insize, char *outbuf,
+                               size_t outsize, codec_options_t *codec_options)
 {
     lzo_uint lzo_complen = 0;
     int res;
@@ -955,9 +1078,11 @@ int64_t lzbench_lzo1f_compress(char *inbuf, size_t insize, char *outbuf, size_t 
         return 0;
 
     if (codec_options->level == 999)
-        res = lzo1f_999_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1f_999_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                                 &lzo_complen, (void *)workmem);
     else
-        res = lzo1f_1_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1f_1_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                               &lzo_complen, (void *)workmem);
 
     if (res != LZO_E_OK)
         return 0;
@@ -965,17 +1090,21 @@ int64_t lzbench_lzo1f_compress(char *inbuf, size_t insize, char *outbuf, size_t 
     return lzo_complen;
 }
 
-int64_t lzbench_lzo1f_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzo1f_decompress(char *inbuf, size_t insize, char *outbuf,
+                                 size_t outsize,
+                                 codec_options_t *codec_options)
 {
     lzo_uint decomplen = 0;
 
-    if (lzo1f_decompress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &decomplen, NULL) != LZO_E_OK)
+    if (lzo1f_decompress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &decomplen,
+                         NULL) != LZO_E_OK)
         return 0;
 
     return decomplen;
 }
 
-int64_t lzbench_lzo1x_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzo1x_compress(char *inbuf, size_t insize, char *outbuf,
+                               size_t outsize, codec_options_t *codec_options)
 {
     lzo_uint lzo_complen = 0;
     int res;
@@ -987,19 +1116,24 @@ int64_t lzbench_lzo1x_compress(char *inbuf, size_t insize, char *outbuf, size_t 
     {
     default:
     case 1:
-        res = lzo1x_1_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1x_1_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                               &lzo_complen, (void *)workmem);
         break;
     case 11:
-        res = lzo1x_1_11_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1x_1_11_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                                  &lzo_complen, (void *)workmem);
         break;
     case 12:
-        res = lzo1x_1_12_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1x_1_12_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                                  &lzo_complen, (void *)workmem);
         break;
     case 15:
-        res = lzo1x_1_15_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1x_1_15_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                                  &lzo_complen, (void *)workmem);
         break;
     case 999:
-        res = lzo1x_999_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1x_999_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                                 &lzo_complen, (void *)workmem);
         break;
     }
 
@@ -1009,17 +1143,21 @@ int64_t lzbench_lzo1x_compress(char *inbuf, size_t insize, char *outbuf, size_t 
     return lzo_complen;
 }
 
-int64_t lzbench_lzo1x_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzo1x_decompress(char *inbuf, size_t insize, char *outbuf,
+                                 size_t outsize,
+                                 codec_options_t *codec_options)
 {
     lzo_uint decomplen = 0;
 
-    if (lzo1x_decompress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &decomplen, NULL) != LZO_E_OK)
+    if (lzo1x_decompress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &decomplen,
+                         NULL) != LZO_E_OK)
         return 0;
 
     return decomplen;
 }
 
-int64_t lzbench_lzo1y_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzo1y_compress(char *inbuf, size_t insize, char *outbuf,
+                               size_t outsize, codec_options_t *codec_options)
 {
     lzo_uint lzo_complen = 0;
     int res;
@@ -1028,9 +1166,11 @@ int64_t lzbench_lzo1y_compress(char *inbuf, size_t insize, char *outbuf, size_t 
         return 0;
 
     if (codec_options->level == 999)
-        res = lzo1y_999_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1y_999_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                                 &lzo_complen, (void *)workmem);
     else
-        res = lzo1y_1_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+        res = lzo1y_1_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                               &lzo_complen, (void *)workmem);
 
     if (res != LZO_E_OK)
         return 0;
@@ -1038,17 +1178,21 @@ int64_t lzbench_lzo1y_compress(char *inbuf, size_t insize, char *outbuf, size_t 
     return lzo_complen;
 }
 
-int64_t lzbench_lzo1y_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzo1y_decompress(char *inbuf, size_t insize, char *outbuf,
+                                 size_t outsize,
+                                 codec_options_t *codec_options)
 {
     lzo_uint decomplen = 0;
 
-    if (lzo1y_decompress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &decomplen, NULL) != LZO_E_OK)
+    if (lzo1y_decompress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &decomplen,
+                         NULL) != LZO_E_OK)
         return 0;
 
     return decomplen;
 }
 
-int64_t lzbench_lzo1z_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzo1z_compress(char *inbuf, size_t insize, char *outbuf,
+                               size_t outsize, codec_options_t *codec_options)
 {
     lzo_uint lzo_complen = 0;
     int res;
@@ -1056,7 +1200,8 @@ int64_t lzbench_lzo1z_compress(char *inbuf, size_t insize, char *outbuf, size_t 
     if (!workmem)
         return 0;
 
-    res = lzo1z_999_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+    res = lzo1z_999_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                             &lzo_complen, (void *)workmem);
 
     if (res != LZO_E_OK)
         return 0;
@@ -1064,17 +1209,21 @@ int64_t lzbench_lzo1z_compress(char *inbuf, size_t insize, char *outbuf, size_t 
     return lzo_complen;
 }
 
-int64_t lzbench_lzo1z_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzo1z_decompress(char *inbuf, size_t insize, char *outbuf,
+                                 size_t outsize,
+                                 codec_options_t *codec_options)
 {
     lzo_uint decomplen = 0;
 
-    if (lzo1z_decompress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &decomplen, NULL) != LZO_E_OK)
+    if (lzo1z_decompress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &decomplen,
+                         NULL) != LZO_E_OK)
         return 0;
 
     return decomplen;
 }
 
-int64_t lzbench_lzo2a_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzo2a_compress(char *inbuf, size_t insize, char *outbuf,
+                               size_t outsize, codec_options_t *codec_options)
 {
     lzo_uint lzo_complen = 0;
     int res;
@@ -1082,7 +1231,8 @@ int64_t lzbench_lzo2a_compress(char *inbuf, size_t insize, char *outbuf, size_t 
     if (!workmem)
         return 0;
 
-    res = lzo2a_999_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &lzo_complen, (void *)workmem);
+    res = lzo2a_999_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                             &lzo_complen, (void *)workmem);
 
     if (res != LZO_E_OK)
         return 0;
@@ -1090,11 +1240,14 @@ int64_t lzbench_lzo2a_compress(char *inbuf, size_t insize, char *outbuf, size_t 
     return lzo_complen;
 }
 
-int64_t lzbench_lzo2a_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzo2a_decompress(char *inbuf, size_t insize, char *outbuf,
+                                 size_t outsize,
+                                 codec_options_t *codec_options)
 {
     lzo_uint decomplen = 0;
 
-    if (lzo2a_decompress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &decomplen, NULL) != LZO_E_OK)
+    if (lzo2a_decompress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &decomplen,
+                         NULL) != LZO_E_OK)
         return 0;
 
     return decomplen;
@@ -1117,15 +1270,21 @@ void lzbench_lzsse2_deinit(char *workmem)
     LZSSE2_FreeOptimalParseState((LZSSE2_OptimalParseState *)workmem);
 }
 
-int64_t lzbench_lzsse2_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzsse2_compress(char *inbuf, size_t insize, char *outbuf,
+                                size_t outsize,
+                                codec_options_t *codec_options)
 {
     if (!codec_options->work_mem)
         return 0;
 
-    return LZSSE2_CompressOptimalParse((LZSSE2_OptimalParseState *)codec_options->work_mem, inbuf, insize, outbuf, outsize, codec_options->level);
+    return LZSSE2_CompressOptimalParse(
+        (LZSSE2_OptimalParseState *)codec_options->work_mem, inbuf, insize,
+        outbuf, outsize, codec_options->level);
 }
 
-int64_t lzbench_lzsse2_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzsse2_decompress(char *inbuf, size_t insize, char *outbuf,
+                                  size_t outsize,
+                                  codec_options_t *codec_options)
 {
     return LZSSE2_Decompress(inbuf, insize, outbuf, outsize);
 }
@@ -1144,15 +1303,21 @@ void lzbench_lzsse4_deinit(char *workmem)
     LZSSE4_FreeOptimalParseState((LZSSE4_OptimalParseState *)workmem);
 }
 
-int64_t lzbench_lzsse4_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzsse4_compress(char *inbuf, size_t insize, char *outbuf,
+                                size_t outsize,
+                                codec_options_t *codec_options)
 {
     if (!codec_options->work_mem)
         return 0;
 
-    return LZSSE4_CompressOptimalParse((LZSSE4_OptimalParseState *)codec_options->work_mem, inbuf, insize, outbuf, outsize, codec_options->level);
+    return LZSSE4_CompressOptimalParse(
+        (LZSSE4_OptimalParseState *)codec_options->work_mem, inbuf, insize,
+        outbuf, outsize, codec_options->level);
 }
 
-int64_t lzbench_lzsse4_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzsse4_decompress(char *inbuf, size_t insize, char *outbuf,
+                                  size_t outsize,
+                                  codec_options_t *codec_options)
 {
     return LZSSE4_Decompress(inbuf, insize, outbuf, outsize);
 }
@@ -1169,12 +1334,15 @@ void lzbench_lzsse4fast_deinit(char *workmem)
     LZSSE4_FreeFastParseState((LZSSE4_FastParseState *)workmem);
 }
 
-int64_t lzbench_lzsse4fast_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzsse4fast_compress(char *inbuf, size_t insize, char *outbuf,
+                                    size_t outsize,
+                                    codec_options_t *codec_options)
 {
     if (!codec_options->work_mem)
         return 0;
 
-    return LZSSE4_CompressFast((LZSSE4_FastParseState *)codec_options->work_mem, inbuf, insize, outbuf, outsize);
+    return LZSSE4_CompressFast((LZSSE4_FastParseState *)codec_options->work_mem,
+                               inbuf, insize, outbuf, outsize);
 }
 
 #include "lzsse/lzsse8/lzsse8.h"
@@ -1191,15 +1359,21 @@ void lzbench_lzsse8_deinit(char *workmem)
     LZSSE8_FreeOptimalParseState((LZSSE8_OptimalParseState *)workmem);
 }
 
-int64_t lzbench_lzsse8_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzsse8_compress(char *inbuf, size_t insize, char *outbuf,
+                                size_t outsize,
+                                codec_options_t *codec_options)
 {
     if (!codec_options->work_mem)
         return 0;
 
-    return LZSSE8_CompressOptimalParse((LZSSE8_OptimalParseState *)codec_options->work_mem, inbuf, insize, outbuf, outsize, codec_options->level);
+    return LZSSE8_CompressOptimalParse(
+        (LZSSE8_OptimalParseState *)codec_options->work_mem, inbuf, insize,
+        outbuf, outsize, codec_options->level);
 }
 
-int64_t lzbench_lzsse8_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzsse8_decompress(char *inbuf, size_t insize, char *outbuf,
+                                  size_t outsize,
+                                  codec_options_t *codec_options)
 {
     return LZSSE8_Decompress(inbuf, insize, outbuf, outsize);
 }
@@ -1216,12 +1390,15 @@ void lzbench_lzsse8fast_deinit(char *workmem)
     LZSSE8_FreeFastParseState((LZSSE8_FastParseState *)workmem);
 }
 
-int64_t lzbench_lzsse8fast_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_lzsse8fast_compress(char *inbuf, size_t insize, char *outbuf,
+                                    size_t outsize,
+                                    codec_options_t *codec_options)
 {
     if (!codec_options->work_mem)
         return 0;
 
-    return LZSSE8_CompressFast((LZSSE8_FastParseState *)codec_options->work_mem, inbuf, insize, outbuf, outsize);
+    return LZSSE8_CompressFast((LZSSE8_FastParseState *)codec_options->work_mem,
+                               inbuf, insize, outbuf, outsize);
 }
 
 #endif
@@ -1229,10 +1406,14 @@ int64_t lzbench_lzsse8fast_compress(char *inbuf, size_t insize, char *outbuf, si
 #ifndef BENCH_REMOVE_QUICKLZ
 #include "quicklz/quicklz151b7.h"
 
-int64_t lzbench_quicklz_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_quicklz_compress(char *inbuf, size_t insize, char *outbuf,
+                                 size_t outsize,
+                                 codec_options_t *codec_options)
 {
     int64_t res;
-    qlz_state_compress *state = (qlz_state_compress *)calloc(1, std::max(qlz151_get_setting_3(1), std::max(qlz151_get_setting_1(1), qlz151_get_setting_2(1))));
+    qlz_state_compress *state = (qlz_state_compress *)calloc(
+        1, std::max(qlz151_get_setting_3(1),
+                    std::max(qlz151_get_setting_1(1), qlz151_get_setting_2(1))));
     if (!state)
         return 0;
 
@@ -1254,10 +1435,14 @@ int64_t lzbench_quicklz_compress(char *inbuf, size_t insize, char *outbuf, size_
     return res;
 }
 
-int64_t lzbench_quicklz_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_quicklz_decompress(char *inbuf, size_t insize, char *outbuf,
+                                   size_t outsize,
+                                   codec_options_t *codec_options)
 {
     int64_t res;
-    qlz_state_compress *dstate = (qlz_state_compress *)calloc(1, std::max(qlz151_get_setting_3(2), std::max(qlz151_get_setting_1(2), qlz151_get_setting_2(2))));
+    qlz_state_compress *dstate = (qlz_state_compress *)calloc(
+        1, std::max(qlz151_get_setting_3(2),
+                    std::max(qlz151_get_setting_1(2), qlz151_get_setting_2(2))));
     if (!dstate)
         return 0;
 
@@ -1284,13 +1469,17 @@ int64_t lzbench_quicklz_decompress(char *inbuf, size_t insize, char *outbuf, siz
 #ifndef BENCH_REMOVE_SNAPPY
 #include "snappy/snappy.h"
 
-int64_t lzbench_snappy_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_snappy_compress(char *inbuf, size_t insize, char *outbuf,
+                                size_t outsize,
+                                codec_options_t *codec_options)
 {
     snappy::RawCompress(inbuf, insize, outbuf, &outsize);
     return outsize;
 }
 
-int64_t lzbench_snappy_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_snappy_decompress(char *inbuf, size_t insize, char *outbuf,
+                                  size_t outsize,
+                                  codec_options_t *codec_options)
 {
     snappy::RawUncompress(inbuf, insize, outbuf);
     return outsize;
@@ -1301,12 +1490,17 @@ int64_t lzbench_snappy_decompress(char *inbuf, size_t insize, char *outbuf, size
 #ifndef BENCH_REMOVE_TORNADO
 #include "tornado/tor_test.h"
 
-int64_t lzbench_tornado_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_tornado_compress(char *inbuf, size_t insize, char *outbuf,
+                                 size_t outsize,
+                                 codec_options_t *codec_options)
 {
-    return tor_compress(codec_options->level, (uint8_t *)inbuf, insize, (uint8_t *)outbuf, outsize);
+    return tor_compress(codec_options->level, (uint8_t *)inbuf, insize,
+                        (uint8_t *)outbuf, outsize);
 }
 
-int64_t lzbench_tornado_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_tornado_decompress(char *inbuf, size_t insize, char *outbuf,
+                                   size_t outsize,
+                                   codec_options_t *codec_options)
 {
     return tor_decompress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, outsize);
 }
@@ -1316,60 +1510,81 @@ int64_t lzbench_tornado_decompress(char *inbuf, size_t insize, char *outbuf, siz
 #ifndef BENCH_REMOVE_UCL
 #include "ucl/ucl.h"
 
-int64_t lzbench_ucl_nrv2b_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_ucl_nrv2b_compress(char *inbuf, size_t insize, char *outbuf,
+                                   size_t outsize,
+                                   codec_options_t *codec_options)
 {
     ucl_uint complen;
-    int res = ucl_nrv2b_99_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &complen, NULL, codec_options->level, NULL, NULL);
+    int res =
+        ucl_nrv2b_99_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                              &complen, NULL, codec_options->level, NULL, NULL);
 
     if (res != UCL_E_OK)
         return 0;
     return complen;
 }
 
-int64_t lzbench_ucl_nrv2b_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_ucl_nrv2b_decompress(char *inbuf, size_t insize, char *outbuf,
+                                     size_t outsize,
+                                     codec_options_t *codec_options)
 {
     ucl_uint decomplen;
-    int res = ucl_nrv2b_decompress_8((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &decomplen, NULL);
+    int res = ucl_nrv2b_decompress_8((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                                     &decomplen, NULL);
 
     if (res != UCL_E_OK)
         return 0;
     return decomplen;
 }
 
-int64_t lzbench_ucl_nrv2d_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_ucl_nrv2d_compress(char *inbuf, size_t insize, char *outbuf,
+                                   size_t outsize,
+                                   codec_options_t *codec_options)
 {
     ucl_uint complen;
-    int res = ucl_nrv2d_99_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &complen, NULL, codec_options->level, NULL, NULL);
+    int res =
+        ucl_nrv2d_99_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                              &complen, NULL, codec_options->level, NULL, NULL);
 
     if (res != UCL_E_OK)
         return 0;
     return complen;
 }
 
-int64_t lzbench_ucl_nrv2d_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_ucl_nrv2d_decompress(char *inbuf, size_t insize, char *outbuf,
+                                     size_t outsize,
+                                     codec_options_t *codec_options)
 {
     ucl_uint decomplen;
-    int res = ucl_nrv2d_decompress_8((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &decomplen, NULL);
+    int res = ucl_nrv2d_decompress_8((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                                     &decomplen, NULL);
 
     if (res != UCL_E_OK)
         return 0;
     return decomplen;
 }
 
-int64_t lzbench_ucl_nrv2e_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_ucl_nrv2e_compress(char *inbuf, size_t insize, char *outbuf,
+                                   size_t outsize,
+                                   codec_options_t *codec_options)
 {
     ucl_uint complen;
-    int res = ucl_nrv2e_99_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &complen, NULL, codec_options->level, NULL, NULL);
+    int res =
+        ucl_nrv2e_99_compress((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                              &complen, NULL, codec_options->level, NULL, NULL);
 
     if (res != UCL_E_OK)
         return 0;
     return complen;
 }
 
-int64_t lzbench_ucl_nrv2e_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_ucl_nrv2e_decompress(char *inbuf, size_t insize, char *outbuf,
+                                     size_t outsize,
+                                     codec_options_t *codec_options)
 {
     ucl_uint decomplen;
-    int res = ucl_nrv2e_decompress_8((uint8_t *)inbuf, insize, (uint8_t *)outbuf, &decomplen, NULL);
+    int res = ucl_nrv2e_decompress_8((uint8_t *)inbuf, insize, (uint8_t *)outbuf,
+                                     &decomplen, NULL);
 
     if (res != UCL_E_OK)
         return 0;
@@ -1381,19 +1596,24 @@ int64_t lzbench_ucl_nrv2e_decompress(char *inbuf, size_t insize, char *outbuf, s
 #ifndef BENCH_REMOVE_ZLIB
 #include "zlib/zlib.h"
 
-int64_t lzbench_zlib_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_zlib_compress(char *inbuf, size_t insize, char *outbuf,
+                              size_t outsize, codec_options_t *codec_options)
 {
     uLongf zcomplen = outsize;
-    int err = compress2((uint8_t *)outbuf, &zcomplen, (uint8_t *)inbuf, insize, codec_options->level);
+    int err = compress2((uint8_t *)outbuf, &zcomplen, (uint8_t *)inbuf, insize,
+                        codec_options->level);
     if (err != Z_OK)
         return 0;
     return zcomplen;
 }
 
-int64_t lzbench_zlib_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_zlib_decompress(char *inbuf, size_t insize, char *outbuf,
+                                size_t outsize,
+                                codec_options_t *codec_options)
 {
     uLongf zdecomplen = outsize;
-    int err = uncompress((uint8_t *)outbuf, &zdecomplen, (uint8_t *)inbuf, insize);
+    int err =
+        uncompress((uint8_t *)outbuf, &zdecomplen, (uint8_t *)inbuf, insize);
     if (err != Z_OK)
         return 0;
     return zdecomplen;
@@ -1410,19 +1630,25 @@ int64_t lzbench_zlib_decompress(char *inbuf, size_t insize, char *outbuf, size_t
 #include "lz/zlib-ng/zlib-ng.h"
 #undef in_func
 
-int64_t lzbench_zlib_ng_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_zlib_ng_compress(char *inbuf, size_t insize, char *outbuf,
+                                 size_t outsize,
+                                 codec_options_t *codec_options)
 {
     size_t zcomplen = outsize;
-    int err = zng_compress2((uint8_t *)outbuf, &zcomplen, (uint8_t *)inbuf, insize, codec_options->level);
+    int err = zng_compress2((uint8_t *)outbuf, &zcomplen, (uint8_t *)inbuf,
+                            insize, codec_options->level);
     if (err != Z_OK)
         return 0;
     return zcomplen;
 }
 
-int64_t lzbench_zlib_ng_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_zlib_ng_decompress(char *inbuf, size_t insize, char *outbuf,
+                                   size_t outsize,
+                                   codec_options_t *codec_options)
 {
     size_t zdecomplen = outsize;
-    int err = zng_uncompress((uint8_t *)outbuf, &zdecomplen, (uint8_t *)inbuf, insize);
+    int err =
+        zng_uncompress((uint8_t *)outbuf, &zdecomplen, (uint8_t *)inbuf, insize);
     if (err != Z_OK)
         return 0;
     return zdecomplen;
@@ -1436,7 +1662,8 @@ extern "C"
 #include "slz/src/slz.h"
 }
 
-int64_t lzbench_slz_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_slz_compress(char *inbuf, size_t insize, char *outbuf,
+                             size_t outsize, codec_options_t *codec_options)
 {
     struct slz_stream strm;
     size_t outlen = 0;
@@ -1467,7 +1694,8 @@ int64_t lzbench_slz_compress(char *inbuf, size_t insize, char *outbuf, size_t ou
 }
 
 /* uses zlib to perform the decompression */
-int64_t lzbench_slz_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_slz_decompress(char *inbuf, size_t insize, char *outbuf,
+                               size_t outsize, codec_options_t *codec_options)
 {
     z_stream stream;
     int err;
@@ -1502,7 +1730,8 @@ int64_t lzbench_slz_decompress(char *inbuf, size_t insize, char *outbuf, size_t 
 #ifndef BENCH_REMOVE_XZ
 #include "lz/xz/src/liblzma/api/lzma.h"
 
-int64_t lzbench_xz_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_xz_compress(char *inbuf, size_t insize, char *outbuf,
+                            size_t outsize, codec_options_t *codec_options)
 {
     lzma_stream strm = LZMA_STREAM_INIT;
     lzma_ret ret;
@@ -1511,9 +1740,10 @@ int64_t lzbench_xz_compress(char *inbuf, size_t insize, char *outbuf, size_t out
     lzma_mt mt_options = {0};
 
     // Compression level: default to 6 if codec_options->level is unset
-    mt_options.preset = (codec_options && codec_options->level >= 0 && codec_options->level <= 9)
-                            ? (uint32_t)codec_options->level
-                            : LZMA_PRESET_DEFAULT;
+    mt_options.preset =
+        (codec_options && codec_options->level >= 0 && codec_options->level <= 9)
+            ? (uint32_t)codec_options->level
+            : LZMA_PRESET_DEFAULT;
 
     // Check type (CRC64 is default and common)
     mt_options.check = LZMA_CHECK_NONE;
@@ -1549,7 +1779,8 @@ int64_t lzbench_xz_compress(char *inbuf, size_t insize, char *outbuf, size_t out
     return (int64_t)compressed_size;
 }
 
-int64_t lzbench_xz_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_xz_decompress(char *inbuf, size_t insize, char *outbuf,
+                              size_t outsize, codec_options_t *codec_options)
 {
     lzma_stream strm = LZMA_STREAM_INIT;
     lzma_ret ret;
@@ -1600,9 +1831,8 @@ namespace baidu
 
         struct MemInputter : public baidu::zling::Inputter
         {
-            MemInputter(uint8_t *buffer, size_t buflen) : m_buffer(buffer),
-                                                          m_buflen(buflen),
-                                                          m_total_read(0) {}
+            MemInputter(uint8_t *buffer, size_t buflen)
+                : m_buffer(buffer), m_buflen(buflen), m_total_read(0) {}
 
             size_t GetData(unsigned char *buf, size_t len)
             {
@@ -1624,9 +1854,8 @@ namespace baidu
 
         struct MemOutputter : public baidu::zling::Outputter
         {
-            MemOutputter(uint8_t *buffer, size_t buflen) : m_buffer(buffer),
-                                                           m_buflen(buflen),
-                                                           m_total_write(0) {}
+            MemOutputter(uint8_t *buffer, size_t buflen)
+                : m_buffer(buffer), m_buflen(buflen), m_total_write(0) {}
 
             size_t PutData(unsigned char *buf, size_t len)
             {
@@ -1649,7 +1878,8 @@ namespace baidu
     } // namespace zling
 } // namespace baidu
 
-int64_t lzbench_zling_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_zling_compress(char *inbuf, size_t insize, char *outbuf,
+                               size_t outsize, codec_options_t *codec_options)
 {
     baidu::zling::MemInputter inputter((uint8_t *)inbuf, insize);
     baidu::zling::MemOutputter outputter((uint8_t *)outbuf, outsize);
@@ -1658,7 +1888,9 @@ int64_t lzbench_zling_compress(char *inbuf, size_t insize, char *outbuf, size_t 
     return outputter.GetOutputSize();
 }
 
-int64_t lzbench_zling_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_zling_decompress(char *inbuf, size_t insize, char *outbuf,
+                                 size_t outsize,
+                                 codec_options_t *codec_options)
 {
     baidu::zling::MemInputter inputter((uint8_t *)inbuf, insize);
     baidu::zling::MemOutputter outputter((uint8_t *)outbuf, outsize);
@@ -1697,9 +1929,13 @@ char *lzbench_zstd_init(size_t insize, size_t level, size_t windowLog)
     if (windowLog && zstd_params->zparams.cParams.windowLog > windowLog)
     {
         zstd_params->zparams.cParams.windowLog = windowLog;
-        zstd_params->zparams.cParams.chainLog = windowLog + ((zstd_params->zparams.cParams.strategy == ZSTD_btlazy2) | (zstd_params->zparams.cParams.strategy == ZSTD_btopt) | (zstd_params->zparams.cParams.strategy == ZSTD_btopt2));
+        zstd_params->zparams.cParams.chainLog =
+            windowLog + ((zstd_params->zparams.cParams.strategy == ZSTD_btlazy2) |
+                         (zstd_params->zparams.cParams.strategy == ZSTD_btopt) |
+                         (zstd_params->zparams.cParams.strategy == ZSTD_btopt2));
     }
-    zstd_params->cdict = ZSTD_createCDict_advanced(NULL, 0, zstd_params->zparams, zstd_params->cmem);
+    zstd_params->cdict = ZSTD_createCDict_advanced(NULL, 0, zstd_params->zparams,
+                                                   zstd_params->cmem);
 #endif
 
     return (char *)zstd_params;
@@ -1719,7 +1955,8 @@ void lzbench_zstd_deinit(char *workmem)
     free(workmem);
 }
 
-int64_t lzbench_zstd_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_zstd_compress(char *inbuf, size_t insize, char *outbuf,
+                              size_t outsize, codec_options_t *codec_options)
 {
     size_t res;
     int windowLog = codec_options->additional_param;
@@ -1729,20 +1966,26 @@ int64_t lzbench_zstd_compress(char *inbuf, size_t insize, char *outbuf, size_t o
         return 0;
 
 #if 1
-    ZSTD_CCtx_setParameter(zstd_params->cctx, ZSTD_c_compressionLevel, codec_options->level);
+    ZSTD_CCtx_setParameter(zstd_params->cctx, ZSTD_c_compressionLevel,
+                           codec_options->level);
     ZSTD_CCtx_setParameter(zstd_params->cctx, ZSTD_c_contentSizeFlag, 1);
 
     if (codec_options->threads > 1)
-        ZSTD_CCtx_setParameter(zstd_params->cctx, ZSTD_c_nbWorkers, codec_options->threads);
+        ZSTD_CCtx_setParameter(zstd_params->cctx, ZSTD_c_nbWorkers,
+                               codec_options->threads);
 
     if (windowLog)
     {
-        size_t currentWindowLog = ZSTD_getParams(codec_options->level, insize, 0).cParams.windowLog;
+        size_t currentWindowLog =
+            ZSTD_getParams(codec_options->level, insize, 0).cParams.windowLog;
         if (currentWindowLog > windowLog)
         {
             ZSTD_CCtx_setParameter(zstd_params->cctx, ZSTD_c_windowLog, windowLog);
-            int strategy = ZSTD_getParams(codec_options->level, insize, 0).cParams.strategy;
-            int chainLog = windowLog + ((strategy == ZSTD_btlazy2) || (strategy == ZSTD_btopt) || (strategy == ZSTD_btultra));
+            int strategy =
+                ZSTD_getParams(codec_options->level, insize, 0).cParams.strategy;
+            int chainLog =
+                windowLog + ((strategy == ZSTD_btlazy2) || (strategy == ZSTD_btopt) ||
+                             (strategy == ZSTD_btultra));
             ZSTD_CCtx_setParameter(zstd_params->cctx, ZSTD_c_chainLog, chainLog);
         }
     }
@@ -1751,7 +1994,8 @@ int64_t lzbench_zstd_compress(char *inbuf, size_t insize, char *outbuf, size_t o
 #else
     if (!zstd_params->cdict)
         return 0;
-    res = ZSTD_compress_usingCDict(zstd_params->cctx, outbuf, outsize, inbuf, insize, zstd_params->cdict);
+    res = ZSTD_compress_usingCDict(zstd_params->cctx, outbuf, outsize, inbuf,
+                                   insize, zstd_params->cdict);
 #endif
     if (ZSTD_isError(res))
         return res;
@@ -1759,7 +2003,9 @@ int64_t lzbench_zstd_compress(char *inbuf, size_t insize, char *outbuf, size_t o
     return res;
 }
 
-int64_t lzbench_zstd_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_zstd_decompress(char *inbuf, size_t insize, char *outbuf,
+                                size_t outsize,
+                                codec_options_t *codec_options)
 {
     zstd_params_s *zstd_params = (zstd_params_s *)codec_options->work_mem;
     if (!zstd_params || !zstd_params->dctx)
@@ -1770,28 +2016,34 @@ int64_t lzbench_zstd_decompress(char *inbuf, size_t insize, char *outbuf, size_t
 
 char *lzbench_zstd_LDM_init(size_t insize, size_t level, size_t windowLog)
 {
-    zstd_params_s *zstd_params = (zstd_params_s *)lzbench_zstd_init(insize, level, windowLog);
+    zstd_params_s *zstd_params =
+        (zstd_params_s *)lzbench_zstd_init(insize, level, windowLog);
     if (!zstd_params)
         return NULL;
-    ZSTD_CCtx_setParameter(zstd_params->cctx, ZSTD_c_enableLongDistanceMatching, 1);
+    ZSTD_CCtx_setParameter(zstd_params->cctx, ZSTD_c_enableLongDistanceMatching,
+                           1);
     return (char *)zstd_params;
 }
 
-int64_t lzbench_zstd_LDM_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_zstd_LDM_compress(char *inbuf, size_t insize, char *outbuf,
+                                  size_t outsize,
+                                  codec_options_t *codec_options)
 {
     zstd_params_s *zstd_params = (zstd_params_s *)codec_options->work_mem;
     if (!zstd_params || !zstd_params->cctx)
         return 0;
-    ZSTD_CCtx_setParameter(zstd_params->cctx, ZSTD_c_enableLongDistanceMatching, 1);
+    ZSTD_CCtx_setParameter(zstd_params->cctx, ZSTD_c_enableLongDistanceMatching,
+                           1);
     return lzbench_zstd_compress(inbuf, insize, outbuf, outsize, codec_options);
 }
 #endif
 
 #ifndef BENCH_REMOVE_ZXC
-#include "zxc/zxc.h"
-#include "zxc/zxc_internal.h"
+#include "zxc/include/zxc.h"
+#include "zxc/src/lib/zxc_internal.h"
 
-int64_t lzbench_zxc_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_zxc_compress(char *inbuf, size_t insize, char *outbuf,
+                             size_t outsize, codec_options_t *codec_options)
 {
     (void)codec_options;
 
@@ -1803,7 +2055,7 @@ int64_t lzbench_zxc_compress(char *inbuf, size_t insize, char *outbuf, size_t ou
 
     zxc_cctx_t ctx;
     // Initialisation avec la taille de chunk par défaut
-    if (zxc_cctx_init(&ctx, ZXC_CHUNK_SIZE, 0, 5) != 0)
+    if (zxc_cctx_init(&ctx, ZXC_CHUNK_SIZE, 1, 5) != 0)
     {
         return 0; // Erreur d'allocation
     }
@@ -1822,11 +2074,13 @@ int64_t lzbench_zxc_compress(char *inbuf, size_t insize, char *outbuf, size_t ou
     while (pos < insize)
     {
         // Calcul de la taille du chunk courant
-        size_t chunk_len = (insize - pos > ZXC_CHUNK_SIZE) ? ZXC_CHUNK_SIZE : (insize - pos);
+        size_t chunk_len =
+            (insize - pos > ZXC_CHUNK_SIZE) ? ZXC_CHUNK_SIZE : (insize - pos);
         size_t rem_cap = dst_end - dst;
 
         // Appel à la fonction statique interne existante
-        int res = zxc_compress_chunk_wrapper(&ctx, src + pos, chunk_len, dst, rem_cap);
+        int res =
+            zxc_compress_chunk_wrapper(&ctx, src + pos, chunk_len, dst, rem_cap);
 
         if (res < 0)
         {
@@ -1844,7 +2098,8 @@ int64_t lzbench_zxc_compress(char *inbuf, size_t insize, char *outbuf, size_t ou
     return (int64_t)(dst - dst_start);
 }
 
-int64_t lzbench_zxc_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, codec_options_t *codec_options)
+int64_t lzbench_zxc_decompress(char *inbuf, size_t insize, char *outbuf,
+                               size_t outsize, codec_options_t *codec_options)
 {
     (void)codec_options;
 
@@ -1881,7 +2136,8 @@ int64_t lzbench_zxc_decompress(char *inbuf, size_t insize, char *outbuf, size_t 
         }
 
         // Appel à la fonction statique interne de décompression
-        int raw_written = zxc_decompress_chunk_wrapper(&ctx, src, src_end - src, dst, dst_end - dst);
+        int raw_written = zxc_decompress_chunk_wrapper(&ctx, src, src_end - src,
+                                                       dst, dst_end - dst);
         if (raw_written < 0)
         {
             zxc_cctx_free(&ctx);
