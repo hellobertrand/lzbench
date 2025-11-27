@@ -2054,7 +2054,7 @@ int64_t lzbench_zxc_compress(char *inbuf, size_t insize, char *outbuf,
     const uint8_t *dst_end = dst + outsize;
 
     zxc_cctx_t ctx;
-    if (zxc_cctx_init(&ctx, ZXC_CHUNK_SIZE, 1, 7) != 0)
+    if (zxc_cctx_init(&ctx, ZXC_CHUNK_SIZE, 1, 5) != 0)
         return 0;
 
     int h_size = zxc_write_file_header(dst, dst_end - dst);
@@ -2103,7 +2103,7 @@ int64_t lzbench_zxc_decompress(char *inbuf, size_t insize, char *outbuf,
     const uint8_t *dst_end = dst + outsize;
 
     zxc_cctx_t ctx;
-    if (zxc_cctx_init(&ctx, ZXC_CHUNK_SIZE, 0, 7) != 0)
+    if (zxc_cctx_init(&ctx, ZXC_CHUNK_SIZE, 0, 5) != 0)
         return 0;
 
     if (zxc_read_file_header(src, insize) != 0)
