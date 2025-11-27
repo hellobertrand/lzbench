@@ -2045,16 +2045,13 @@ int64_t lzbench_zstd_LDM_compress(char *inbuf, size_t insize, char *outbuf,
 int64_t lzbench_zxc_compress(char *inbuf, size_t insize, char *outbuf,
                              size_t outsize, codec_options_t *codec_options)
 {
-    (void)codec_options;
-
-    // Conversion des types char* -> uint8_t*
     const uint8_t *src = (const uint8_t *)inbuf;
     uint8_t *dst = (uint8_t *)outbuf;
     uint8_t *dst_start = dst;
     const uint8_t *dst_end = dst + outsize;
 
     zxc_cctx_t ctx;
-    if (zxc_cctx_init(&ctx, ZXC_CHUNK_SIZE, 1, 5) != 0)
+    if (zxc_cctx_init(&ctx, ZXC_CHUNK_SIZE, 1, codec_options->level) != 0)
         return 0;
 
     int h_size = zxc_write_file_header(dst, dst_end - dst);
@@ -2078,7 +2075,7 @@ int64_t lzbench_zxc_compress(char *inbuf, size_t insize, char *outbuf,
         if (res < 0)
         {
             zxc_cctx_free(&ctx);
-            return 0; // Erreur ou buffer out trop petit
+            return 0;
         }
 
         dst += res;
@@ -2086,16 +2083,12 @@ int64_t lzbench_zxc_compress(char *inbuf, size_t insize, char *outbuf,
     }
 
     zxc_cctx_free(&ctx);
-
-    // Retourne la taille compressée totale
     return (int64_t)(dst - dst_start);
 }
 
 int64_t lzbench_zxc_decompress(char *inbuf, size_t insize, char *outbuf,
                                size_t outsize, codec_options_t *codec_options)
 {
-    (void)codec_options;
-
     const uint8_t *src = (const uint8_t *)inbuf;
     const uint8_t *src_end = src + insize;
     uint8_t *dst = (uint8_t *)outbuf;
@@ -2103,7 +2096,7 @@ int64_t lzbench_zxc_decompress(char *inbuf, size_t insize, char *outbuf,
     const uint8_t *dst_end = dst + outsize;
 
     zxc_cctx_t ctx;
-    if (zxc_cctx_init(&ctx, ZXC_CHUNK_SIZE, 0, 5) != 0)
+    if (zxc_cctx_init(&ctx, ZXC_CHUNK_SIZE, 0, codec_options->level) != 0)
         return 0;
 
     if (zxc_read_file_header(src, insize) != 0)
@@ -2127,7 +2120,7 @@ int64_t lzbench_zxc_decompress(char *inbuf, size_t insize, char *outbuf,
         if (raw_written < 0)
         {
             zxc_cctx_free(&ctx);
-            return 0; // Erreur de décompression
+            return 0;
         }
 
         int has_crc = (bh.block_flags & ZXC_BLOCK_FLAG_CHECKSUM);
