@@ -192,7 +192,7 @@ static int zxc_encode_block_gnr(zxc_cctx_t *ctx, const uint8_t *src,
   // Parameter tuning based on levels (1-9)
   // Categories: 1-3 (Fast), 4-6 (Balanced), 7-9 (Strong)
   if (ctx->compression_level <= 3) {
-    search_depth = 16; // Increased depth, no lazy (Target < 47)
+    search_depth = 4; // Reduced depth for speed (Target < 47)
     use_lazy = 0;
   } else if (ctx->compression_level <= 6) {
     search_depth = 4; // Lazy enabled (Target < 45)
@@ -218,20 +218,18 @@ static int zxc_encode_block_gnr(zxc_cctx_t *ctx, const uint8_t *src,
 
   uint32_t miss_count = 0; // Dynamic acceleration counter
 
+  // Pre-calculate acceleration parameters
+  // L1-3: Standard acceleration (shift 3) as per l1_3 tuning
+  // L4-9: Aggressive acceleration (shift 4, trigger 16) to reach +30% speed
+  const int accel_shift = (ctx->compression_level <= 3) ? 3 : 4;
+  const int accel_cap = (ctx->compression_level <= 3) ? 32 : 6;
+  const int accel_trigger = (ctx->compression_level <= 3) ? 8 : 16;
+
   while (LIKELY(ip < mflimit)) {
-    size_t step = 1;
-
-    // Dynamic Acceleration: If we fail to find matches repeatedly, speed up
-    // Tune acceleration based on level
-    int accel_trigger = (ctx->compression_level <= 3) ? 8 : 32;
-    int accel_shift = (ctx->compression_level <= 3) ? 3 : 5;
-    int accel_cap = (ctx->compression_level <= 3) ? 32 : 8;
-
-    if (miss_count > accel_trigger) {
-      step = 1 + (miss_count >> accel_shift);
-      if (step > accel_cap)
-        step = accel_cap;
-    }
+    // Branchless Acceleration
+    size_t step = 1 + (miss_count >> accel_shift);
+    if (step > accel_cap)
+      step = accel_cap;
 
     if (UNLIKELY(ip + step >= mflimit)) {
       ip += step;
@@ -257,71 +255,75 @@ static int zxc_encode_block_gnr(zxc_cctx_t *ctx, const uint8_t *src,
 
     // Dynamic Search Depth: If we are skipping (accelerating), don't search
     // deep
-    int current_depth = (miss_count > 16) ? 2 : search_depth;
+    int current_depth = (miss_count > 32) ? 2 : search_depth;
+
+    // Unrolled Search Loop (4x unroll for common case)
+    // We must continue searching to find the BEST match, not just the first
+    // one.
+
     int attempts = current_depth;
 
-    while (match_idx > 0 && attempts-- >= 0) {
-      if (cur_pos - match_idx >= ZXC_LZ_MAX_DIST)
-        break;
+    // Helper macro for match checking
+    // Helper macro for match checking
+#define CHECK_MATCH(m_idx, uid)                                                \
+  if (m_idx > 0) {                                                             \
+    if (cur_pos - m_idx < ZXC_LZ_MAX_DIST) {                                   \
+      const uint8_t *ref = src + m_idx;                                        \
+      if (zxc_le32(ref) == cur_val && ref[best_len] == ip[best_len]) {         \
+        uint32_t mlen = 4;                                                     \
+        const uint8_t *limit_8 = iend - 8;                                     \
+        while (ip + mlen < limit_8) {                                          \
+          if (zxc_le64(ip + mlen) == zxc_le64(ref + mlen))                     \
+            mlen += 8;                                                         \
+          else {                                                               \
+            mlen += (__builtin_ctzll(zxc_le64(ip + mlen) ^                     \
+                                     zxc_le64(ref + mlen)) >>                  \
+                     3);                                                       \
+            goto _match_len_done_##uid;                                        \
+          }                                                                    \
+        }                                                                      \
+        while (ip + mlen < iend && ref[mlen] == ip[mlen])                      \
+          mlen++;                                                              \
+        _match_len_done_##uid : if (mlen > best_len) {                         \
+          best_len = mlen;                                                     \
+          best_ref = ref;                                                      \
+          if (best_len >= 128)                                                 \
+            goto _search_done;                                                 \
+        }                                                                      \
+      }                                                                        \
+      m_idx = ctx->chain_table[m_idx];                                         \
+    } else                                                                     \
+      m_idx = 0;                                                               \
+  }
 
-      const uint8_t *ref = src + match_idx;
-
-      if (zxc_le32(ref) == cur_val && ref[best_len] == ip[best_len]) {
-        uint32_t mlen = 4;
-#if defined(XZK_USE_AVX512)
-        const uint8_t *limit_64 = iend - 64;
-        while (ip + mlen < limit_64) {
-          __m512i v_src = _mm512_loadu_si512((const void *)(ip + mlen));
-          __m512i v_ref = _mm512_loadu_si512((const void *)(ref + mlen));
-          __mmask64 mask = _mm512_cmpeq_epi8_mask(v_src, v_ref);
-          if (mask == 0xFFFFFFFFFFFFFFFF)
-            mlen += 64;
-          else {
-            mlen += (uint32_t)__builtin_ctzll(~mask);
-            goto _match_len_done;
-          }
-        }
-#elif defined(ZXC_USE_AVX2)
-        const uint8_t *limit_32 = iend - 32;
-        while (ip + mlen < limit_32) {
-          __m256i v_src = _mm256_loadu_si256((const __m256i *)(ip + mlen));
-          __m256i v_ref = _mm256_loadu_si256((const __m256i *)(ref + mlen));
-          __m256i v_cmp = _mm256_cmpeq_epi8(v_src, v_ref);
-          uint32_t mask = (uint32_t)_mm256_movemask_epi8(v_cmp);
-          if (mask == 0xFFFFFFFF)
-            mlen += 32;
-          else {
-            mlen += __builtin_ctz(~mask);
-            goto _match_len_done;
-          }
-        }
-#endif
-        const uint8_t *limit_8 = iend - 8;
-        while (ip + mlen < limit_8) {
-          if (zxc_le64(ip + mlen) == zxc_le64(ref + mlen))
-            mlen += 8;
-          else {
-            mlen +=
-                (__builtin_ctzll(zxc_le64(ip + mlen) ^ zxc_le64(ref + mlen)) >>
-                 3);
-            goto _match_len_done;
-          }
-        }
-        while (ip + mlen < iend && ref[mlen] == ip[mlen])
-          mlen++;
-
-      _match_len_done:
-        if (mlen > best_len) {
-          best_len = mlen;
-          best_ref = ref;
-          if (best_len >= 128) // Early exit for good matches
-            break;
-        }
-      }
-      match_idx = ctx->chain_table[match_idx];
+    // Unroll 4 times
+    if (attempts > 0) {
+      CHECK_MATCH(match_idx, 1);
+      attempts--;
+    }
+    if (attempts > 0) {
+      CHECK_MATCH(match_idx, 2);
+      attempts--;
+    }
+    if (attempts > 0) {
+      CHECK_MATCH(match_idx, 3);
+      attempts--;
+    }
+    if (attempts > 0) {
+      CHECK_MATCH(match_idx, 4);
+      attempts--;
     }
 
-    if (use_lazy && best_ref && best_len < 128 && ip + 1 < mflimit) {
+    // Fallback loop
+    while (match_idx > 0 && attempts-- > 0) {
+      CHECK_MATCH(match_idx, 99);
+    }
+
+  _search_done:;
+
+#undef CHECK_MATCH
+    if (use_lazy && best_ref && best_len < 32 &&
+        ip + 1 < mflimit) { // Only lazy if match is short
       uint32_t next_val = zxc_le32(ip + 1);
       uint32_t h2 = zxc_hash_func(next_val) & (ZXC_LZ_HASH_SIZE - 1);
       uint32_t next_head = ctx->hash_table[2 * h2];
@@ -351,7 +353,6 @@ static int zxc_encode_block_gnr(zxc_cctx_t *ctx, const uint8_t *src,
 
     if (best_ref) {
       miss_count = 0; // Reset acceleration on match
-
       while (ip > anchor && best_ref > src && ip[-1] == best_ref[-1]) {
         ip--;
         best_ref--;
@@ -373,7 +374,6 @@ static int zxc_encode_block_gnr(zxc_cctx_t *ctx, const uint8_t *src,
         anchor = ip;
         break;
       }
-
       ip += best_len;
       anchor = ip;
     } else {
