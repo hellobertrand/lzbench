@@ -218,6 +218,12 @@ static int zxc_encode_block_gnr(zxc_cctx_t *ctx, const uint8_t *src,
 
   uint32_t miss_count = 0; // Dynamic acceleration counter
 
+  // Output Buffers for Direct Stream Generation
+  uint8_t *buf_tokens = (uint8_t *)ctx->buf_off;   // Reuse buf_off for tokens
+  uint16_t *buf_offsets = (uint16_t *)ctx->buf_ml; // Reuse buf_ml for offsets
+  uint32_t *buf_extras = ctx->buf_ll;              // Reuse buf_ll for extras
+  size_t n_extras = 0;
+
   // Pre-calculate acceleration parameters
   // L1-3: Standard acceleration (shift 3) as per l1_3 tuning
   // L4-9: Aggressive acceleration (shift 4, trigger 16) to reach +30% speed
@@ -353,6 +359,7 @@ static int zxc_encode_block_gnr(zxc_cctx_t *ctx, const uint8_t *src,
 
     if (best_ref) {
       miss_count = 0; // Reset acceleration on match
+
       while (ip > anchor && best_ref > src && ip[-1] == best_ref[-1]) {
         ip--;
         best_ref--;
@@ -360,20 +367,38 @@ static int zxc_encode_block_gnr(zxc_cctx_t *ctx, const uint8_t *src,
       }
 
       if (seq_c < ctx->max_seq_count) {
-        ctx->sequences[seq_c].lit_len = (uint32_t)(ip - anchor);
-        ctx->sequences[seq_c].match_len =
-            (uint32_t)(best_len - ZXC_LZ_MIN_MATCH);
-        ctx->sequences[seq_c].offset = (uint32_t)(ip - best_ref);
-        if (ctx->sequences[seq_c].lit_len > 0) {
-          memcpy(ctx->literals + lit_c, anchor, ctx->sequences[seq_c].lit_len);
-          lit_c += ctx->sequences[seq_c].lit_len;
+        // Direct Encoding
+        uint32_t ll = (uint32_t)(ip - anchor);
+        uint32_t ml = (uint32_t)(best_len - ZXC_LZ_MIN_MATCH);
+        uint32_t off = (uint32_t)(ip - best_ref);
+
+        // Store literals
+        if (ll > 0) {
+          memcpy(ctx->literals + lit_c, anchor, ll);
+          lit_c += ll;
         }
+
+        // Encode Token
+        uint8_t ll_code = (ll >= 15) ? 15 : (uint8_t)ll;
+        uint8_t ml_code = (ml >= 15) ? 15 : (uint8_t)ml;
+        buf_tokens[seq_c] = (ll_code << 4) | ml_code;
+
+        // Store Offset
+        buf_offsets[seq_c] = (uint16_t)off;
+
+        // Store Extras
+        if (ll >= 15)
+          buf_extras[n_extras++] = ll;
+        if (ml >= 15)
+          buf_extras[n_extras++] = ml;
+
         seq_c++;
       } else {
         ip += best_len;
         anchor = ip;
         break;
       }
+
       ip += best_len;
       anchor = ip;
     } else {
@@ -386,29 +411,6 @@ static int zxc_encode_block_gnr(zxc_cctx_t *ctx, const uint8_t *src,
   if (last_lits > 0) {
     memcpy(ctx->literals + lit_c, anchor, last_lits);
     lit_c += last_lits;
-  }
-
-  // --- TOKEN ENCODING ---
-  uint8_t *buf_tokens = (uint8_t *)ctx->buf_off;   // Reuse buf_off for tokens
-  uint16_t *buf_offsets = (uint16_t *)ctx->buf_ml; // Reuse buf_ml for offsets
-  uint32_t *buf_extras = ctx->buf_ll;              // Reuse buf_ll for extras
-  size_t n_extras = 0;
-
-  for (uint32_t i = 0; i < seq_c; i++) {
-    uint32_t ll = ctx->sequences[i].lit_len;
-    uint32_t ml = ctx->sequences[i].match_len;
-    uint32_t off = ctx->sequences[i].offset;
-
-    uint8_t ll_code = (ll >= 15) ? 15 : (uint8_t)ll;
-    uint8_t ml_code = (ml >= 15) ? 15 : (uint8_t)ml;
-
-    buf_tokens[i] = (ll_code << 4) | ml_code;
-    buf_offsets[i] = (uint16_t)off;
-
-    if (ll >= 15)
-      buf_extras[n_extras++] = ll;
-    if (ml >= 15)
-      buf_extras[n_extras++] = ml;
   }
 
   size_t h_gap = ZXC_BLOCK_HEADER_SIZE + (chk ? 4 : 0);
