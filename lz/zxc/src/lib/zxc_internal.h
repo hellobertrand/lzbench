@@ -38,6 +38,7 @@ extern "C"
 #define ZXC_VERSION 1                    // Current file format version
 #define ZXC_CHUNK_SIZE (256 * 1024)      // Size of data blocks processed by threads
 #define ZXC_IO_BUFFER_SIZE (1024 * 1024) // Size of stdio buffers
+#define ZXC_PAD_SIZE 32                  // Padding size for buffer overruns
 
 // Binary Header Sizes
 #define ZXC_FILE_HEADER_SIZE 8 // Magic (4 bytes) + Version (1 byte) + Reserved (3 bytes)
@@ -56,12 +57,16 @@ extern "C"
 
     /**
      * @enum zxc_block_type_t
-     * @brief Defines the different types of data blocks supported by the ZXC format.
+     * @brief Defines the different types of data blocks supported by the ZXC
+     * format.
      *
-     * This enumeration categorizes blocks based on the compression strategy applied:
-     * - `ZXC_BLOCK_RAW`: Used for high-entropy data that cannot be compressed effectively.
+     * This enumeration categorizes blocks based on the compression strategy
+     * applied:
+     * - `ZXC_BLOCK_RAW`: Used for high-entropy data that cannot be compressed
+     * effectively.
      * - `ZXC_BLOCK_GNR`: General-purpose compression using LZ77-based variants.
-     * - `ZXC_BLOCK_NUM`: Specialized compression for numeric data using Delta encoding and Bitpacking.
+     * - `ZXC_BLOCK_NUM`: Specialized compression for numeric data using Delta
+     * encoding and Bitpacking.
      */
     typedef enum
     {
@@ -74,8 +79,8 @@ extern "C"
      * @enum zxc_section_encoding_t
      * @brief Specifies the encoding methods used for internal data sections.
      *
-     * These modes determine how specific components (like literals, match lengths, or offsets)
-     * are stored within a block.
+     * These modes determine how specific components (like literals, match lengths,
+     * or offsets) are stored within a block.
      * - `ZXC_SECTION_ENCODING_RAW`: Data is stored uncompressed.
      * - `ZXC_SECTION_ENCODING_RLE`: Run-Length Encoding.
      * - `ZXC_SECTION_ENCODING_BITPACK`: Bitpacking for integer values.
@@ -121,8 +126,8 @@ extern "C"
      * @struct zxc_gnr_header_t
      * @brief Header specific to General (LZ-based) compression blocks.
      *
-     * This header follows the main block header when the block type is GNR. It describes
-     * the layout of sequences and literals.
+     * This header follows the main block header when the block type is GNR. It
+     * describes the layout of sequences and literals.
      *
      * @var zxc_gnr_header_t::n_sequences
      * The total count of LZ sequences in the block.
@@ -139,10 +144,17 @@ extern "C"
      */
     typedef struct
     {
-        uint32_t n_sequences;                           // Number of sequences
-        uint32_t n_literals;                            // Number of literals
-        uint8_t enc_lit, enc_litlen, enc_mlen, enc_off; // Encoding methods per stream
+        uint32_t n_sequences; // Number of sequences
+        uint32_t n_literals;  // Number of literals
+        uint8_t enc_lit, enc_litlen, enc_mlen,
+            enc_off; // Unused in Token format (kept for alignment)
     } zxc_gnr_header_t;
+
+// Token Format Constants
+#define ZXC_TOKEN_LIT_BITS 4
+#define ZXC_TOKEN_ML_BITS 4
+#define ZXC_TOKEN_LIT_MASK 0xF0
+#define ZXC_TOKEN_ML_MASK 0x0F
 
     /**
      * @struct zxc_section_desc_t
@@ -186,6 +198,7 @@ extern "C"
  */
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
+#include <nmmintrin.h>
 #if defined(__AVX512F__) && defined(__AVX512BW__)
 #define XZK_USE_AVX512
 #endif
@@ -196,6 +209,7 @@ extern "C"
 #define ZXC_USE_SSE41
 #endif
 #elif defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_acle.h>
 #include <arm_neon.h>
 #define ZXC_USE_NEON
 #endif
@@ -246,6 +260,28 @@ extern "C"
     static inline void zxc_store_le64(void *p, uint64_t v) { memcpy(p, &v, sizeof(v)); }
 
     /*
+     * Efficient 16-byte copy using SIMD.
+     */
+    static inline void zxc_copy16(void *dst, const void *src)
+    {
+        memcpy(dst, src, 16);
+    }
+
+    /*
+     * Hardware-accelerated hash function.
+     */
+    static inline uint32_t zxc_hash_func(uint32_t val)
+    {
+#if defined(ZXC_USE_SSE41) || defined(__SSE4_2__)
+        return _mm_crc32_u32(0, val);
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    return __crc32cw(0, val);
+#else
+    return (val * 2654435761U);
+#endif
+    }
+
+    /*
      * Returns the index of the highest set bit (Log2 approximation).
      */
     static inline uint8_t zxc_highbit32(uint32_t n)
@@ -259,8 +295,9 @@ extern "C"
     }
 
     /*
-     * ZigZag encoding maps signed integers to unsigned integers so that numbers with
-     * small absolute values (positive or negative) become small unsigned integers.
+     * ZigZag encoding maps signed integers to unsigned integers so that numbers
+     * with small absolute values (positive or negative) become small unsigned
+     * integers.
      */
     static inline uint32_t zxc_zigzag_encode(int32_t n)
     {
@@ -271,7 +308,8 @@ extern "C"
         return (int32_t)(n >> 1) ^ -(int32_t)(n & 1);
     }
 
-    // Checks if a buffer consists of a single repeated byte (Run-Length Encoding candidate).
+    // Checks if a buffer consists of a single repeated byte (Run-Length Encoding
+    // candidate).
     static inline int zxc_is_rle(const uint8_t *src, size_t len)
     {
         if (len < 8)
@@ -288,7 +326,7 @@ extern "C"
  * COMPRESSION CONTEXT & STRUCTS
  * ============================================================================
  */
-#define ZXC_LZ_HASH_BITS 15                      // 32K entries
+#define ZXC_LZ_HASH_BITS 15                      // 32K entries (fits in L1)
 #define ZXC_LZ_HASH_SIZE (1 << ZXC_LZ_HASH_BITS) // Hash table size
 #define ZXC_LZ_WINDOW_SIZE (1 << 16)             // 64KB sliding window
 #define ZXC_LZ_MIN_MATCH 4                       // Minimum match length
@@ -315,28 +353,30 @@ extern "C"
      * @typedef zxc_cctx_t
      * @brief Compression Context structure.
      *
-     * This structure holds the state and buffers required for the compression process.
-     * It is designed to be reused across multiple blocks or calls to avoid the
-     * overhead of repeated memory allocations.
+     * This structure holds the state and buffers required for the compression
+     * process. It is designed to be reused across multiple blocks or calls to avoid
+     * the overhead of repeated memory allocations.
      *
-     * @field hash_table Pointer to the hash table used for LZ77 match finding. Stores indices into the
-     * input buffer based on hash values. field chain_table Pointer to the chain table for collision
-     * resolution. Used to store previous positions for hash collisions (if chaining is enabled).
-     * @field sequences Pointer to the buffer holding intermediate sequences. Holds the raw
-     * match/literal length data before entropy encoding.
+     * @field hash_table Pointer to the hash table used for LZ77 match finding.
+     * Stores indices into the input buffer based on hash values. field chain_table
+     * Pointer to the chain table for collision resolution. Used to store previous
+     * positions for hash collisions (if chaining is enabled).
+     * @field sequences Pointer to the buffer holding intermediate sequences. Holds
+     * the raw match/literal length data before entropy encoding.
      *  @field buf_ll Pointer to the buffer for literal length codes.
      * @field buf_ml Pointer to the buffer for match length codes.
      * @field buf_off Pointer to the buffer for offset codes.
-     * @field literals Pointer to the buffer for raw literal bytes. These are the bytes that could not
-     * be matched during LZ77.
-     * @field max_seq_count The capacity of the sequences buffer. Allows reusing the hash table without
-     * zeroing it out completely between blocks.
-     *  @field epoch Current epoch counter for lazy hash table invalidation. Allows reusing the hash
-     * table without zeroing it out completely between blocks.
-     * @field checksum_enabled Flag indicating if checksums should be computed. 0 = disabled, 1 =
-     * enabled.
-     * @field compression_level The configured compression level. Determines trade-offs between speed
-     * and compression ratio (e.g., hash table size, search depth).
+     * @field literals Pointer to the buffer for raw literal bytes. These are the
+     * bytes that could not be matched during LZ77.
+     * @field max_seq_count The capacity of the sequences buffer. Allows reusing the
+     * hash table without zeroing it out completely between blocks.
+     *  @field epoch Current epoch counter for lazy hash table invalidation. Allows
+     * reusing the hash table without zeroing it out completely between blocks.
+     * @field checksum_enabled Flag indicating if checksums should be computed. 0 =
+     * disabled, 1 = enabled.
+     * @field compression_level The configured compression level. Determines
+     * trade-offs between speed and compression ratio (e.g., hash table size, search
+     * depth).
      */
     typedef struct
     {
@@ -361,14 +401,14 @@ extern "C"
      * It buffers bits from the input byte stream into an accumulator to allow
      * reading variable-length bit sequences.
      *
-     * @field ptr Pointer to the current position in the input byte stream. This pointer advances as
-     * bytes are loaded into the accumulator.
-     * @field end Pointer to the end of the input byte stream. Used to prevent reading past the bounds
-     * of the input buffer.
-     * @field accum Bit accumulator holding buffered bits. A 64-bit buffer that holds the bits currently
-     * loaded from the stream but not yet consumed.
-     * @field bits Number of valid bits currently in the accumulator. Indicates how many bits are
-     * available in @c accum to be read.
+     * @field ptr Pointer to the current position in the input byte stream. This
+     * pointer advances as bytes are loaded into the accumulator.
+     * @field end Pointer to the end of the input byte stream. Used to prevent
+     * reading past the bounds of the input buffer.
+     * @field accum Bit accumulator holding buffered bits. A 64-bit buffer that
+     * holds the bits currently loaded from the stream but not yet consumed.
+     * @field bits Number of valid bits currently in the accumulator. Indicates how
+     * many bits are available in @c accum to be read.
      */
     typedef struct
     {
@@ -382,17 +422,19 @@ extern "C"
      * @typedef zxc_chunk_processor_t
      * @brief Function pointer type for processing a chunk of data.
      *
-     * This type defines the signature for internal functions responsible for processing
-     * (compressing or transforming) a specific chunk of input data.
+     * This type defines the signature for internal functions responsible for
+     * processing (compressing or transforming) a specific chunk of input data.
      *
-     * @param ctx     Pointer to the compression context containing state and configuration.
+     * @param ctx     Pointer to the compression context containing state and
+     * configuration.
      * @param in      Pointer to the input data buffer.
      * @param in_sz   Size of the input data in bytes.
-     * @param out     Pointer to the output buffer where processed data will be written.
+     * @param out     Pointer to the output buffer where processed data will be
+     * written.
      * @param out_cap Capacity of the output buffer in bytes.
      *
-     * @return The number of bytes written to the output buffer on success, or a negative
-     *         error code on failure.
+     * @return The number of bytes written to the output buffer on success, or a
+     * negative error code on failure.
      */
     typedef int (*zxc_chunk_processor_t)(zxc_cctx_t *ctx, const uint8_t *in, size_t in_sz, uint8_t *out,
                                          size_t out_cap);
@@ -454,7 +496,8 @@ extern "C"
      * Checks for the correct magic bytes and version number.
      *
      * @param src Pointer to the start of the file data.
-     * @param src_size Size of the available source data (must be at least header size).
+     * @param src_size Size of the available source data (must be at least header
+     * size).
      * @return The size of the header in bytes on success, or a negative error code.
      */
     int zxc_read_file_header(const uint8_t *src, size_t src_size);
@@ -479,7 +522,8 @@ extern "C"
      * @param src Pointer to the current position in the source stream.
      * @param src_size Available bytes remaining in the source stream.
      * @param bh Pointer to a block header structure to populate.
-     * @return The number of bytes read (header size) on success, or a negative error code.
+     * @return The number of bytes read (header size) on success, or a negative
+     * error code.
      */
     int zxc_read_block_header(const uint8_t *src, size_t src_size, zxc_block_header_t *bh);
 
@@ -499,7 +543,8 @@ extern "C"
     /**
      * @brief Initializes a bit reader structure.
      *
-     * Sets up the internal state of the bit reader to read from the specified source buffer.
+     * Sets up the internal state of the bit reader to read from the specified
+     * source buffer.
      *
      * @param br Pointer to the bit reader structure to initialize.
      * @param src Pointer to the source buffer containing the data to read.
@@ -519,16 +564,17 @@ extern "C"
     /**
      * @brief Bit-packs a stream of 32-bit integers into a destination buffer.
      *
-     * Compresses an array of 32-bit integers by packing them using a specified number of bits per
-     * integer.
+     * Compresses an array of 32-bit integers by packing them using a specified
+     * number of bits per integer.
      *
      * @param src Pointer to the source array of 32-bit integers.
      * @param count The number of integers to pack.
-     * @param dst Pointer to the destination buffer where packed data will be written.
+     * @param dst Pointer to the destination buffer where packed data will be
+     * written.
      * @param dst_cap The capacity of the destination buffer in bytes.
      * @param bits The number of bits to use for each integer during packing.
-     * @return The number of bytes written to the destination buffer, or a negative error code on
-     * failure.
+     * @return The number of bytes written to the destination buffer, or a negative
+     * error code on failure.
      */
     int zxc_bitpack_stream_32(const uint32_t *RESTRICT src, size_t count, uint8_t *RESTRICT dst,
                               size_t dst_cap, uint8_t bits);
@@ -541,7 +587,8 @@ extern "C"
      * @param dst Pointer to the destination buffer.
      * @param rem The remaining space in the destination buffer.
      * @param nh Pointer to the numeric header structure to write.
-     * @return The number of bytes written, or a negative error code if the buffer is too small.
+     * @return The number of bytes written, or a negative error code if the buffer
+     * is too small.
      */
     int zxc_write_num_header(uint8_t *dst, size_t rem, const zxc_num_header_t *nh);
 
@@ -553,12 +600,14 @@ extern "C"
      * @param src Pointer to the source buffer.
      * @param src_size The size of the source buffer available for reading.
      * @param nh Pointer to the numeric header structure to populate.
-     * @return The number of bytes read from the source, or a negative error code on failure.
+     * @return The number of bytes read from the source, or a negative error code on
+     * failure.
      */
     int zxc_read_num_header(const uint8_t *src, size_t src_size, zxc_num_header_t *nh);
 
     /**
-     * @brief Writes a generic header and section descriptors to a destination buffer.
+     * @brief Writes a generic header and section descriptors to a destination
+     * buffer.
      *
      * Serializes the `zxc_gnr_header_t` and an array of 4 section descriptors.
      *
@@ -566,7 +615,8 @@ extern "C"
      * @param rem The remaining space in the destination buffer.
      * @param gh Pointer to the generic header structure to write.
      * @param desc Array of 4 section descriptors to write.
-     * @return The number of bytes written, or a negative error code if the buffer is too small.
+     * @return The number of bytes written, or a negative error code if the buffer
+     * is too small.
      */
     int zxc_write_gnr_header_and_desc(uint8_t *dst, size_t rem, const zxc_gnr_header_t *gh,
                                       const zxc_section_desc_t desc[4]);
@@ -574,13 +624,15 @@ extern "C"
     /**
      * @brief Reads a generic header and section descriptors from a source buffer.
      *
-     * Deserializes data into a `zxc_gnr_header_t` and an array of 4 section descriptors.
+     * Deserializes data into a `zxc_gnr_header_t` and an array of 4 section
+     * descriptors.
      *
      * @param src Pointer to the source buffer.
      * @param len The length of the source buffer available for reading.
      * @param gh Pointer to the generic header structure to populate.
      * @param desc Array of 4 section descriptors to populate.
-     * @return The number of bytes read from the source, or a negative error code on failure.
+     * @return The number of bytes read from the source, or a negative error code on
+     * failure.
      */
     int zxc_read_gnr_header_and_desc(const uint8_t *src, size_t len, zxc_gnr_header_t *gh,
                                      zxc_section_desc_t desc[4]);
@@ -588,30 +640,33 @@ extern "C"
     /**
      * @brief Runs the main compression/decompression stream engine.
      *
-     * This function orchestrates the processing of data from an input stream to an output stream,
-     * potentially utilizing multiple threads for parallel processing. It handles the setup,
-     * execution, and teardown of the streaming process based on the specified configuration.
+     * This function orchestrates the processing of data from an input stream to an
+     * output stream, potentially utilizing multiple threads for parallel
+     * processing. It handles the setup, execution, and teardown of the streaming
+     * process based on the specified configuration.
      *
      * @param f_in Pointer to the input file stream (source data).
      * @param f_out Pointer to the output file stream (destination data).
-     * @param n_threads The number of threads to use for processing. If 0 or 1, processing may be
-     * sequential.
+     * @param n_threads The number of threads to use for processing. If 0 or 1,
+     * processing may be sequential.
      * @param mode The operation mode (e.g., compression or decompression).
-     * @param level The compression level to apply (relevant only for compression mode).
-     * @param checksum Flag indicating whether to calculate and verify checksums (1 for yes, 0 for no).
-     * @param func The chunk processing callback function (`zxc_chunk_processor_t`) responsible for
-     *             handling individual data blocks.
+     * @param level The compression level to apply (relevant only for compression
+     * mode).
+     * @param checksum Flag indicating whether to calculate and verify checksums (1
+     * for yes, 0 for no).
+     * @param func The chunk processing callback function (`zxc_chunk_processor_t`)
+     * responsible for handling individual data blocks.
      *
      * @return Returns 0 on success, or a non-zero error code on failure.
      */
     int zxc_stream_engine_run(FILE *f_in, FILE *f_out, int n_threads, int mode, int level, int checksum,
                               zxc_chunk_processor_t func);
 
-    int zxc_decompress_chunk_wrapper(zxc_cctx_t *ctx, const uint8_t *src, size_t src_sz,
-                                     uint8_t *dst, size_t dst_cap);
+    int zxc_decompress_chunk_wrapper(zxc_cctx_t *ctx, const uint8_t *src, size_t src_sz, uint8_t *dst,
+                                     size_t dst_cap);
 
-    int zxc_compress_chunk_wrapper(zxc_cctx_t *ctx, const uint8_t *chunk, size_t sz,
-                                   uint8_t *dst, size_t cap);
+    int zxc_compress_chunk_wrapper(zxc_cctx_t *ctx, const uint8_t *chunk, size_t sz, uint8_t *dst,
+                                   size_t cap);
 
 #ifdef __cplusplus
 }
