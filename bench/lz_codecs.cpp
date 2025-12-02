@@ -2124,7 +2124,7 @@ int64_t lzbench_zxc_decompress(char *inbuf, size_t insize, char *outbuf,
         }
 
         int has_crc = (bh.block_flags & ZXC_BLOCK_FLAG_CHECKSUM);
-        size_t header_overhead = ZXC_BLOCK_HEADER_SIZE + (has_crc ? 4 : 0);
+        size_t header_overhead = ZXC_BLOCK_HEADER_SIZE + (has_crc ? ZXC_BLOCK_CHECKSUM_SIZE : 0);
         size_t block_total_size = header_overhead + bh.comp_size;
 
         src += block_total_size;
