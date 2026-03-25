@@ -81,8 +81,8 @@ int zxc_cctx_init(zxc_cctx_t* RESTRICT ctx, const size_t chunk_size, const int m
     ctx->chunk_size = chunk_size;
     const uint32_t offset_bits = zxc_log2_u32((uint32_t)chunk_size);
     ctx->offset_bits = offset_bits;
-    ctx->offset_mask = (1U << offset_bits) - 1;
-    ctx->max_epoch = 1U << (32 - offset_bits);
+    ctx->offset_mask = (uint32_t)((1ULL << offset_bits) - 1);
+    ctx->max_epoch = (uint32_t)(1ULL << (32 - offset_bits));
 
     if (mode == 0) return ZXC_OK;
 
@@ -590,6 +590,18 @@ uint64_t zxc_compress_bound(const size_t input_size) {
 }
 
 /*
+ * @brief Returns the maximum compressed size for a single block (no file framing).
+ *
+ * @param[in] input_size Uncompressed block size in bytes.
+ * @return Upper bound on compressed block size, or 0 on overflow.
+ */
+uint64_t zxc_compress_block_bound(const size_t input_size) {
+    if (UNLIKELY(input_size > (SIZE_MAX - (SIZE_MAX >> 8)))) return 0;
+    // Block header + worst-case expansion (64B overhead) + checksum
+    return (uint64_t)ZXC_BLOCK_HEADER_SIZE + (uint64_t)input_size + 64 + ZXC_BLOCK_CHECKSUM_SIZE;
+}
+
+/*
  * ============================================================================
  * ERROR CODE UTILITIES
  * ============================================================================
@@ -638,3 +650,40 @@ const char* zxc_error_name(const int code) {
             return "ZXC_UNKNOWN_ERROR";
     }
 }
+
+/*
+ * ============================================================================
+ * LIBRARY INFORMATION
+ * ============================================================================
+ */
+
+/*
+ * @brief Returns the minimum supported compression level.
+ *
+ * Returns the value of ZXC_LEVEL_FASTEST (currently 1).
+ * This allows integrators to discover the level range at runtime without relying on
+ * compile-time macros alone.
+ */
+int zxc_min_level(void) { return ZXC_LEVEL_FASTEST; }
+
+/*
+ * @brief Returns the maximum supported compression level.
+ *
+ * Returns the value of ZXC_LEVEL_COMPACT (currently 5).
+ */
+int zxc_max_level(void) { return ZXC_LEVEL_COMPACT; }
+
+/*
+ * @brief Returns the default compression level.
+ *
+ * Returns the value of ZXC_LEVEL_DEFAULT (currently 3).
+ */
+int zxc_default_level(void) { return ZXC_LEVEL_DEFAULT; }
+
+/*
+ * @brief Returns the human-readable library version string.
+ *
+ * The returned pointer is a compile-time constant and must not be freed.
+ * Example: "0.9.1".
+ */
+const char* zxc_version_string(void) { return ZXC_LIB_VERSION_STR; }

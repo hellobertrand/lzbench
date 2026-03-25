@@ -25,9 +25,9 @@
 /** @brief Major version number. */
 #define ZXC_VERSION_MAJOR 0
 /** @brief Minor version number. */
-#define ZXC_VERSION_MINOR 9
+#define ZXC_VERSION_MINOR 10
 /** @brief Patch version number. */
-#define ZXC_VERSION_PATCH 1
+#define ZXC_VERSION_PATCH 0
 
 /** @cond INTERNAL */
 #define ZXC_STR_HELPER(x) #x
@@ -88,5 +88,22 @@ typedef enum {
 } zxc_compression_level_t;
 
 /** @} */ /* end of levels */
+
+/**
+ * @defgroup checksum_algo Checksum Algorithm
+ * @brief Identifies the hash function used for block and global checksums.
+ *
+ * The algorithm ID is stored in bits 0-3 of the File Header Flags byte,
+ * allowing up to 16 distinct algorithms.  Pass one of these values as
+ * @c checksum_algo in @ref zxc_compress_opts_t.
+ *
+ * At decompression time the algorithm is always read from the file header,
+ * so no selection is required in @ref zxc_decompress_opts_t.
+ * @{
+ */
+typedef enum {
+    ZXC_CHECKSUM_ALGO_RAPIDHASH = 0, /**< RapidHash v3 (default, zero-init value). */
+} zxc_checksum_algo_t;
+/** @} */ /* end of checksum_algo */
 
 #endif  // ZXC_CONSTANTS_H
