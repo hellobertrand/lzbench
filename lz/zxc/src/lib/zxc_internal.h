@@ -28,6 +28,7 @@
 
 #include <assert.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -77,8 +78,12 @@ extern "C" {
  * - @c ZXC_USE_AVX2   - AVX2 available.
  * - @c ZXC_USE_NEON64 - AArch64 NEON available.
  * - @c ZXC_USE_NEON32 - ARMv7 NEON available.
+ *
+ * Define @c ZXC_DISABLE_SIMD to gate all hand-written SIMD paths (intrinsics,
+ * inline assembly).  Compiler auto-vectorisation is unaffected.
  * @{
  */
+#ifndef ZXC_DISABLE_SIMD
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
 #include <nmmintrin.h>
@@ -108,6 +113,7 @@ extern "C" {
 #endif
 #endif
 #endif
+#endif    /* ZXC_DISABLE_SIMD */
 /** @} */ /* end of SIMD Intrinsics */
 
 /**
@@ -287,14 +293,10 @@ extern "C" {
 #define ZXC_MAX_THREADS 512
 /** @brief Safety padding appended to buffers to tolerate overruns. */
 #define ZXC_PAD_SIZE 32
-/** @brief Number of bits per byte (constant 8). */
-#define ZXC_BITS_PER_BYTE 8
 /** @brief Assumed CPU cache line size for alignment. */
 #define ZXC_CACHE_LINE_SIZE 64
 /** @brief Bitmask for cache-line alignment checks. */
 #define ZXC_ALIGNMENT_MASK (ZXC_CACHE_LINE_SIZE - 1)
-/** @brief Maximum byte length of a variable-byte encoded integer. */
-#define ZXC_VBYTE_MAX_LEN 5
 /** @brief Allocation-safe max vbyte length (sufficient for < 2 MB blocks). */
 #define ZXC_VBYTE_ALLOC_LEN 3
 
@@ -383,13 +385,16 @@ extern "C" {
 /** @name LZ77 Constants
  *  @brief Hash table geometry, sliding window, and match parameters.
  *
- *  The hash table uses 14 bits for addressing (16 384 entries), doubled to
- *  keep the load factor below 0.5.  Each entry stores
- *  `(epoch << 18) | offset`, totalling 64 KB of memory.
+ *  The hash table uses a split layout with 15-bit addressing (32 768 buckets):
+ *  - `hash_positions[]`: uint32_t, stores `(epoch << offset_bits) | position` (128 KB).
+ *  - `hash_tags[]`:      uint8_t, stores an 8-bit tag for fast rejection (32 KB).
+ *  Total: 160 KB.  The tag table fits in L1 cache, enabling a
+ *  "filter-first" access pattern that avoids cold loads into hash_positions
+ *  on the ~60-75% of lookups where the tag mismatches.
  *  The 64 KB sliding window allows `chain_table` to use `uint16_t`.
  *  @{ */
-/** @brief Address bits for the LZ77 hash table (2^14 = 16 384 max). */
-#define ZXC_LZ_HASH_BITS 14
+/** @brief Address bits for the LZ77 hash table (2^15 = 32 768 buckets). */
+#define ZXC_LZ_HASH_BITS 15
 /** @brief Marsaglia multiplicative hash constant for 4-byte hashing. */
 #define ZXC_LZ_HASH_PRIME1 0x2D35182DU
 /** @brief Marsaglia/Vigna xorshift* multiplier for 5-byte hashing. */
@@ -404,15 +409,6 @@ extern "C" {
 #define ZXC_LZ_OFFSET_BIAS 1
 /** @brief Maximum allowed offset distance. */
 #define ZXC_LZ_MAX_DIST (ZXC_LZ_WINDOW_SIZE - 1)
-/**
- * @brief Number of bits reserved for epoch tracking in compressed pointers.
- * Derived from chunk size: 2^18 = ZXC_BLOCK_SIZE_DEFAULT => 32 - 18 = 14 bits.
- */
-#define ZXC_EPOCH_BITS 14
-/** @brief Mask to extract the offset bits from a compressed pointer. */
-#define ZXC_OFFSET_MASK ((1U << (32 - ZXC_EPOCH_BITS)) - 1)
-/** @brief Maximum number of epochs supported by the compression system. */
-#define ZXC_MAX_EPOCH (1U << ZXC_EPOCH_BITS)
 /** @} */
 
 /** @name Hash Prime Constants
@@ -513,10 +509,10 @@ static ZXC_ALWAYS_INLINE zxc_lz77_params_t zxc_get_lz77_params(const int level) 
     // search_depth, sufficient_len, use_lazy, lazy_attempts, lazy_len_threshold, step_base,
     // step_shift
     static const zxc_lz77_params_t table[5] = {
-        {4, 16, 0, 0, 0, 4, 4},    // fallback
-        {4, 16, 0, 0, 0, 4, 4},    // level 1
-        {6, 24, 0, 0, 0, 3, 6},    // level 2
-        {3, 18, 1, 4, 128, 1, 4},  // level 3
+        {3, 16, 0, 0, 0, 4, 4},    // fallback
+        {3, 16, 0, 0, 0, 4, 4},    // level 1
+        {3, 18, 0, 0, 0, 3, 6},    // level 2
+        {3, 16, 1, 4, 128, 1, 4},  // level 3
         {3, 18, 1, 4, 128, 1, 5}   // level 4
     };
     return table[level < 1 ? 1 : level];
@@ -555,17 +551,8 @@ typedef enum {
  * or offsets) are stored within a block.
  * - `ZXC_SECTION_ENCODING_RAW`: Data is stored uncompressed.
  * - `ZXC_SECTION_ENCODING_RLE`: Run-Length Encoding.
- * - `ZXC_SECTION_ENCODING_BITPACK`: Bitpacking for integer values.
- * - `ZXC_SECTION_ENCODING_FSE`: Finite State Entropy (Reserved).
- * - `ZXC_SECTION_ENCODING_BITPACK_FSE`: Combined Bitpacking and FSE (Reserved).
  */
-typedef enum {
-    ZXC_SECTION_ENCODING_RAW = 0,
-    ZXC_SECTION_ENCODING_RLE = 1,
-    ZXC_SECTION_ENCODING_BITPACK = 2,
-    ZXC_SECTION_ENCODING_FSE = 3,         // Reserved
-    ZXC_SECTION_ENCODING_BITPACK_FSE = 4  // Reserved
-} zxc_section_encoding_t;
+typedef enum { ZXC_SECTION_ENCODING_RAW = 0, ZXC_SECTION_ENCODING_RLE = 1 } zxc_section_encoding_t;
 
 /**
  * @struct zxc_gnr_header_t
@@ -801,13 +788,13 @@ static ZXC_ALWAYS_INLINE uint8_t zxc_hash8(const uint8_t* p) {
  * @return uint16_t The computed hash value.
  */
 static ZXC_ALWAYS_INLINE uint16_t zxc_hash16(const uint8_t* p) {
-    const uint64_t h1 = zxc_le64(p);
-    const uint64_t h2 = zxc_le64(p + 8);
-    uint64_t h = h1 ^ h2 ^ ZXC_HASH_PRIME2;
+    const uint64_t v1 = zxc_le64(p);
+    const uint64_t v2 = zxc_le64(p + 8);
+    uint64_t h = v1 ^ v2 ^ ZXC_HASH_PRIME2;
     h ^= h << 13;
     h ^= h >> 7;
     h ^= h << 17;
-    uint32_t res = (uint32_t)((h >> 32) ^ h);
+    const uint32_t res = (uint32_t)((h >> 32) ^ h);
     return (uint16_t)((res >> 16) ^ res);
 }
 
@@ -1022,7 +1009,7 @@ static ZXC_ALWAYS_INLINE uint32_t zxc_checksum(const void* RESTRICT input, const
     (void)hash_method; /* single algorithm for now; extend when adding more */
     const uint64_t hash = rapidhash(input, len);
 
-    return (uint32_t)(hash ^ (hash >> (sizeof(uint32_t) * ZXC_BITS_PER_BYTE)));
+    return (uint32_t)(hash ^ (hash >> (sizeof(uint32_t) * CHAR_BIT)));
 }
 
 /**
@@ -1058,7 +1045,7 @@ static ZXC_ALWAYS_INLINE uint32_t zxc_hash_combine_rotate(const uint32_t hash,
 static ZXC_ALWAYS_INLINE uint64_t zxc_le_partial(const uint8_t* p, size_t n) {
 #ifdef ZXC_BIG_ENDIAN
     uint64_t v = 0;
-    for (size_t i = 0; i < n; i++) v |= (uint64_t)p[i] << (i * 8);
+    for (size_t i = 0; i < n; i++) v |= (uint64_t)p[i] << (i * CHAR_BIT);
     return v;
 #else
     uint64_t v = 0;
@@ -1086,11 +1073,11 @@ static ZXC_ALWAYS_INLINE void zxc_br_init(zxc_bit_reader_t* RESTRICT br,
     if (UNLIKELY(size < sizeof(uint64_t))) {
         br->accum = zxc_le_partial(src, size);
         br->ptr += size;
-        br->bits = (int)(size * 8);
+        br->bits = (int)(size * CHAR_BIT);
     } else {
         br->accum = zxc_le64(br->ptr);
         br->ptr += sizeof(uint64_t);
-        br->bits = sizeof(uint64_t) * 8;
+        br->bits = sizeof(uint64_t) * CHAR_BIT;
     }
 }
 
@@ -1111,16 +1098,16 @@ static ZXC_ALWAYS_INLINE void zxc_br_ensure(zxc_bit_reader_t* RESTRICT br, const
         br->bits = safe_bits;
 
         // Mask out garbage bits (retain only valid existing bits)
-#if defined(__BMI2__) && (defined(__x86_64__) || defined(_M_X64))
+#if !defined(ZXC_DISABLE_SIMD) && defined(__BMI2__) && (defined(__x86_64__) || defined(_M_X64))
         br->accum = _bzhi_u64(br->accum, safe_bits);
 #else
-        br->accum &= ((1ULL << safe_bits) - 1);
+        br->accum &= (safe_bits < 64) ? ((1ULL << safe_bits) - 1) : ~0ULL;
 #endif
 
         // Calculate how many bytes we can read
         // We want to fill up to the accumulation capability (64 bits for uint64_t)
         // Bytes needed = (capacity_bits - safe_bits) / 8
-        const int bytes_needed = ((int)(sizeof(uint64_t) * 8) - safe_bits) >> 3;
+        const int bytes_needed = ((int)(sizeof(uint64_t) * CHAR_BIT) - safe_bits) / CHAR_BIT;
 
         // Bounds check: zxc_le64 always reads 8 bytes, so we need at least 8
         const size_t bytes_left = (size_t)(br->end - br->ptr);
@@ -1129,15 +1116,15 @@ static ZXC_ALWAYS_INLINE void zxc_br_ensure(zxc_bit_reader_t* RESTRICT br, const
             const size_t to_read =
                 (bytes_left < (size_t)bytes_needed) ? bytes_left : (size_t)bytes_needed;
             const uint64_t raw = zxc_le_partial(br->ptr, to_read);
-            br->accum |= (raw << safe_bits);
+            br->accum |= (safe_bits < 64) ? (raw << safe_bits) : 0;
             br->ptr += to_read;
-            br->bits = safe_bits + (int)to_read * 8;
+            br->bits = safe_bits + (int)to_read * CHAR_BIT;
         } else {
             // Fast path: full 8-byte read is safe
             const uint64_t raw = zxc_le64(br->ptr);
-            br->accum |= (raw << safe_bits);
+            br->accum |= (safe_bits < 64) ? (raw << safe_bits) : 0;
             br->ptr += bytes_needed;
-            br->bits = safe_bits + bytes_needed * 8;
+            br->bits = safe_bits + bytes_needed * CHAR_BIT;
         }
     }
 }
