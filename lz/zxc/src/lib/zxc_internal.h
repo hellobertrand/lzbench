@@ -20,23 +20,19 @@
  * - Internal function prototypes for chunk-level compression/decompression.
  *
  * @warning Do not include this header from user code; use the public headers
- *          zxc_buffer.h, zxc_stream.h, or zxc_sans_io.h instead.
+ *          zxc_buffer.h or zxc_stream.h instead.
  */
 
 #ifndef ZXC_INTERNAL_H
 #define ZXC_INTERNAL_H
 
-#include <assert.h>
-#include <inttypes.h>
-#include <limits.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include "zxc_deps.h" /* libc deps: <limits.h>, <stdint.h>, <stdlib.h>, <string.h>,
+                        and the ZXC_MALLOC / ZXC_ALIGNED_MALLOC macros.
+                        Vendor this file to retarget non-libc environments. */
 
 #include "../../include/zxc_buffer.h"
 #include "../../include/zxc_constants.h"
-#include "../../include/zxc_sans_io.h"
+#include "../../include/zxc_seekable.h"
 #include "rapidhash.h"
 
 #ifdef __cplusplus
@@ -76,8 +72,19 @@ extern "C" {
  * may be defined:
  * - @c ZXC_USE_AVX512 - AVX-512F + AVX-512BW available.
  * - @c ZXC_USE_AVX2   - AVX2 available.
+ * - @c ZXC_USE_SSE2   - SSE2 (x86-64 baseline) available.
  * - @c ZXC_USE_NEON64 - AArch64 NEON available.
  * - @c ZXC_USE_NEON32 - ARMv7 NEON available.
+ *
+ * Note: @c -mavx2 / @c -mavx512f imply @c __SSE2__, so @c ZXC_USE_SSE2 is
+ * also defined in the AVX variants. The hand-written SIMD code paths therefore
+ * order their preprocessor branches AVX512 -> AVX2 -> SSE2 so the widest
+ * available path wins; the SSE2 branch is the active one only in the dedicated
+ * @c _sse2 variant (no AVX2/AVX512 flags). SSE2 is the x86-64 baseline, so this
+ * tier covers every 64-bit x86 CPU (and i686 with @c -msse2). The handful of
+ * operations that would otherwise require SSE4.1 (@c _mm_max_epu32,
+ * @c _mm_blendv_epi8, @c _mm_packus_epi32) or SSSE3 (@c _mm_shuffle_epi8) are
+ * emulated with pure SSE2 instruction sequences or fall back to scalar code.
  *
  * Define @c ZXC_DISABLE_SIMD to gate all hand-written SIMD paths (intrinsics,
  * inline assembly).  Compiler auto-vectorisation is unaffected.
@@ -95,6 +102,11 @@ extern "C" {
 #if defined(__AVX2__)
 #ifndef ZXC_USE_AVX2
 #define ZXC_USE_AVX2
+#endif
+#endif
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#ifndef ZXC_USE_SSE2
+#define ZXC_USE_SSE2
 #endif
 #endif
 #elif (defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(_M_ARM64) || \
@@ -233,6 +245,10 @@ extern "C" {
 #endif
 /** @} */ /* end of Compiler Abstractions */
 
+/* Heap allocator and cache-line-aligned allocator macros are now defined
+ * in @c zxc_deps.h (included at the top of this header), so non-libc
+ * targets can override them by vendoring that single file. */
+
 /**
  * @name Endianness Detection
  * @brief Compile-time detection of host byte order.
@@ -287,10 +303,7 @@ extern "C" {
 #define ZXC_MAGIC_WORD 0x9CB02EF5U
 /** @brief Current on-disk file format version. */
 #define ZXC_FILE_FORMAT_VERSION 5
-/** @brief Size of stdio I/O buffers (1 MB). */
-#define ZXC_IO_BUFFER_SIZE (1024 * 1024)
-/** @brief Maximum number of threads allowed for streaming operations. */
-#define ZXC_MAX_THREADS 512
+
 /** @brief Safety padding appended to buffers to tolerate overruns. */
 #define ZXC_PAD_SIZE 32
 /**
@@ -312,8 +325,13 @@ extern "C" {
 /** @brief Round @p x up to the next cache-line boundary. */
 #define ZXC_ALIGN_CL(x) (((x) + ZXC_ALIGNMENT_MASK) & ~(size_t)ZXC_ALIGNMENT_MASK)
 
-/** @brief File header size: Magic(4)+Version(1)+Chunk(1)+Flags(1)+Reserved(7)+CRC(2). */
-#define ZXC_FILE_HEADER_SIZE 16
+/**
+ * @brief Number of @c uint64_t words needed to hold a bitmap of @p n_bits.
+ *
+ * Equivalent to @c ceil(n_bits / 64).
+ */
+#define ZXC_BITMAP_WORDS(n_bits) (((n_bits) + 63) / 64)
+
 /** @brief Bit flag in the Flags byte indicating checksum presence (bit 7). */
 #define ZXC_FILE_FLAG_HAS_CHECKSUM 0x80U
 /** @brief Mask for the checksum algorithm id (bits 0-3). */
@@ -329,6 +347,15 @@ extern "C" {
 #define ZXC_GLO_HEADER_BINARY_SIZE 16
 /** @brief Binary size of a GHI block sub-header. */
 #define ZXC_GHI_HEADER_BINARY_SIZE 16
+
+/** @brief Worst-case format overhead inside a single block beyond the outer
+ *  8-byte block header and the optional 4-byte checksum.
+ *
+ *  Covers the inner GLO/GHI sub-header (16 B) plus four section descriptors
+ *  (4 x 8 = 32 B) = 48 B, with a 16 B safety margin for future format
+ *  evolution. Used by zxc_compress_block_bound() and zxc_compress_bound()
+ *  to size the destination buffer in the worst (incompressible) case. */
+#define ZXC_BLOCK_FORMAT_OVERHEAD 64
 
 /** @brief Binary size of a NUM chunk sub-frame header (nvals + bits + base + psize). */
 #define ZXC_NUM_CHUNK_HEADER_SIZE 16
@@ -352,8 +379,6 @@ extern "C" {
 
 /** @brief Size of the global checksum appended after EOF block (4 bytes). */
 #define ZXC_GLOBAL_CHECKSUM_SIZE 4
-/** @brief File footer size: original_size(8) + global_checksum(4). */
-#define ZXC_FILE_FOOTER_SIZE 12
 
 /** @name Seekable Format Constants
  *  @brief Seek table block appended between EOF block and footer.
@@ -435,6 +460,23 @@ extern "C" {
 #define ZXC_LZ_WINDOW_MASK (ZXC_LZ_WINDOW_SIZE - 1U)
 /** @brief Minimum match length for an LZ77 match. */
 #define ZXC_LZ_MIN_MATCH_LEN 5
+/** @brief Maximum legitimate value a varint can decode to.
+ *
+ * A varint value represents (ll - MASK) or (ml - MASK) and is therefore always
+ * strictly less than ZXC_BLOCK_SIZE_MAX (enforced by the Block API entry
+ * points). The cap is set to (ZXC_BLOCK_SIZE_MAX - 1), which fits cleanly in a
+ * 3-byte varint (21 bits): the decoder rejects any 4- or 5-byte encoding, and
+ * the encoder refuses to emit values above this bound. Together they bound the
+ * varint surface to exactly the format-defined block size limit. */
+#define ZXC_MAX_VARINT_VALUE ((uint32_t)(ZXC_BLOCK_SIZE_MAX - 1U))
+/** @brief Maximum decoded output of a single sequence with INLINE ll/ml
+ *         (non-varint). Used by 4x decoder bounds checks to reserve space for
+ *         subsequent inline sequences in the same batch when the current
+ *         sequence has a varint-extended ml. */
+#define ZXC_GLO_MAX_INLINE_OUT_PER_SEQ \
+    ((ZXC_TOKEN_LL_MASK - 1U) + (ZXC_TOKEN_ML_MASK - 1U) + ZXC_LZ_MIN_MATCH_LEN) /* 33 */
+#define ZXC_GHI_MAX_INLINE_OUT_PER_SEQ \
+    ((ZXC_SEQ_LL_MASK - 1U) + (ZXC_SEQ_ML_MASK - 1U) + ZXC_LZ_MIN_MATCH_LEN) /* 513 */
 /** @brief Base bias added to encoded offsets (stored = actual - bias). */
 #define ZXC_LZ_OFFSET_BIAS 1
 /** @brief Maximum allowed offset distance. */
@@ -982,8 +1024,8 @@ static ZXC_ALWAYS_INLINE uint16_t zxc_hash16(const uint8_t* p) {
  * @param[in] src Pointer to the source memory block.
  */
 static ZXC_ALWAYS_INLINE void zxc_copy16(void* dst, const void* src) {
-#if defined(ZXC_USE_AVX2) || defined(ZXC_USE_AVX512)
-    // AVX2/AVX512: Single 128-bit unaligned load/store
+#if defined(ZXC_USE_AVX2) || defined(ZXC_USE_AVX512) || defined(ZXC_USE_SSE2)
+    // x86 SSE2/AVX2/AVX512: Single 128-bit unaligned load/store
     _mm_storeu_si128((__m128i*)dst, _mm_loadu_si128((const __m128i*)src));
 #elif defined(ZXC_USE_NEON64) || defined(ZXC_USE_NEON32)
     vst1q_u8((uint8_t*)dst, vld1q_u8((const uint8_t*)src));
@@ -1004,6 +1046,11 @@ static ZXC_ALWAYS_INLINE void zxc_copy32(void* dst, const void* src) {
 #if defined(ZXC_USE_AVX2) || defined(ZXC_USE_AVX512)
     // AVX2/AVX512: Single 256-bit (32 byte) unaligned load/store
     _mm256_storeu_si256((__m256i*)dst, _mm256_loadu_si256((const __m256i*)src));
+#elif defined(ZXC_USE_SSE2)
+    // SSE2: Two 128-bit (16 byte) unaligned load/stores (no 256-bit regs)
+    _mm_storeu_si128((__m128i*)dst, _mm_loadu_si128((const __m128i*)src));
+    _mm_storeu_si128((__m128i*)((uint8_t*)dst + 16),
+                     _mm_loadu_si128((const __m128i*)((const uint8_t*)src + 16)));
 #elif defined(ZXC_USE_NEON64) || defined(ZXC_USE_NEON32)
     // NEON: Two 128-bit (16 byte) unaligned load/stores
     vst1q_u8((uint8_t*)dst, vld1q_u8((const uint8_t*)src));
@@ -1481,6 +1528,140 @@ int zxc_huf_encode_section(const uint8_t* RESTRICT literals, const size_t n_lite
 int zxc_huf_decode_section(const uint8_t* RESTRICT payload, const size_t payload_size,
                            uint8_t* RESTRICT dst, const size_t n_literals);
 
+/* ---------------------------------------------------------------------------
+ * Compression / decompression context.
+ *
+ * The context owns the working buffers (hash table, sequence buffers, scratch
+ * memory) that the encoder and decoder reuse across blocks. It used to be
+ * exposed via zxc_sans_io.h, but no consumer outside of the library itself
+ * needs to drive it directly - the public buffer / streaming / seekable APIs
+ * already provide opaque wrappers (`zxc_create_cctx` / `zxc_create_dctx`).
+ * Keeping the layout private lets us evolve the buffer layout (cache-line
+ * placement, additional scratch arenas) without breaking the ABI.
+ * --------------------------------------------------------------------------- */
+
+/**
+ * @struct zxc_cctx_t
+ * @brief Compression / decompression context.
+ *
+ * Holds the buffers reused across blocks to avoid repeated allocations.
+ *
+ * **Key fields:**
+ * - @c hash_table: epoch-tagged positions (`ZXC_LZ_HASH_SIZE` * 4 bytes).
+ * - @c hash_tags:  8-bit tags for fast match rejection
+ *   (`ZXC_LZ_HASH_SIZE` * 1 byte).
+ * - @c chain_table: collision chain storing the *previous* occurrence of a
+ *   hash, forming a linked list per bucket and enabling history traversal.
+ * - @c epoch: drives "lazy hash table invalidation". Instead of memset-ing
+ *   the hash table for every block, we store `(epoch << 16) | offset`; an
+ *   entry whose stored epoch differs from `ctx->epoch` is treated as empty.
+ */
+typedef struct {
+    /* Hot zone: random access / high frequency.
+     * Kept at the start to ensure they reside in the first cache line (64 bytes). */
+    uint32_t* hash_table;  /**< Hash table for LZ77 match positions (epoch|pos). */
+    uint8_t* hash_tags;    /**< Split tag table for fast match rejection (8-bit tags). */
+    uint16_t* chain_table; /**< Chain table for collision resolution. */
+    void* memory_block;    /**< Single allocation block owner. */
+    uint32_t epoch;        /**< Current epoch for lazy hash table invalidation. */
+
+    /* Warm zone: sequential access per sequence. */
+    uint32_t* buf_sequences; /**< Buffer for sequence records (packed: LL(8)|ML(8)|Offset(16)). */
+    uint8_t* buf_tokens;     /**< Buffer for token sequences. */
+    uint16_t* buf_offsets;   /**< Buffer for offsets. */
+    uint8_t* buf_extras;     /**< Buffer for extra lengths (vbytes for LL/ML). */
+    uint8_t* literals;       /**< Buffer for literal bytes. */
+
+    /* Cold zone: configuration / scratch / resizeable. */
+    uint8_t* lit_buffer;    /**< Scratch buffer for literals (RLE / Huffman). */
+    size_t lit_buffer_cap;  /**< Current capacity of the scratch buffer. */
+    uint8_t* work_buf;      /**< Padded scratch buffer for buffer-API decompression. */
+    size_t work_buf_cap;    /**< Capacity of the work buffer. */
+    uint8_t* opt_scratch;   /**< Optimal-parser DP scratch (level >= 6 only,
+                                 lazy-allocated, packs dp/parent_len/parent_off/actions).
+                                 Also reused as transient scratch for the
+                                 length-limited Huffman code-length builder. */
+    size_t opt_scratch_cap; /**< Current capacity of opt_scratch in bytes. */
+    int checksum_enabled;   /**< 1 if checksum calculation/verification is enabled. */
+    int compression_level;  /**< Compression level. */
+
+    /* Block-size derived parameters (computed once at init). */
+    size_t chunk_size;    /**< Effective block size in bytes. */
+    uint32_t offset_bits; /**< log2(chunk_size) - governs epoch_mark shift. */
+    uint32_t offset_mask; /**< (1U << offset_bits) - 1 */
+    uint32_t max_epoch;   /**< 1U << (32 - offset_bits) */
+} zxc_cctx_t;
+
+/**
+ * @brief Initialises a ZXC compression / decompression context in place.
+ *
+ * Allocates the internal buffers (hash table, sequence buffers, scratch) sized
+ * for @p chunk_size and the requested @p mode.
+ *
+ * @param[out] ctx               Context to initialise.
+ * @param[in]  chunk_size        Block size driving buffer sizing.
+ * @param[in]  mode              1 for compression, 0 for decompression.
+ * @param[in]  level             Compression level (ignored when @p mode == 0).
+ * @param[in]  checksum_enabled  Non-zero to enable checksum computation.
+ *
+ * @return @c ZXC_OK on success, or a negative @ref zxc_error_t code (notably
+ *         @c ZXC_ERROR_MEMORY on allocation failure).
+ */
+int zxc_cctx_init(zxc_cctx_t* ctx, const size_t chunk_size, const int mode, const int level,
+                  const int checksum_enabled);
+
+/**
+ * @brief Returns the byte count that @ref zxc_cctx_init would allocate for
+ *        the given parameters.
+ *
+ * Used by the static-cctx public API to size a caller-supplied workspace
+ * before calling @ref zxc_cctx_init_in_workspace.
+ *
+ * @param[in] chunk_size  Block size in bytes (must satisfy
+ *                        @ref zxc_validate_block_size).
+ * @param[in] mode        1 = compression, 0 = decompression.
+ * @param[in] level       Compression level (only consulted when @p mode == 1).
+ * @return Size in bytes, or 0 if the parameters are invalid.
+ */
+size_t zxc_cctx_compute_workspace_size(const size_t chunk_size, const int mode, const int level);
+
+/**
+ * @brief Initialises a compression / decompression context inside a
+ *        caller-supplied workspace.
+ *
+ * Identical to @ref zxc_cctx_init except that the persistent buffer is
+ * carved out of @p workspace instead of being @c ZXC_ALIGNED_MALLOC'd
+ * internally.  @p workspace must be cache-line aligned and at least as
+ * large as @ref zxc_cctx_compute_workspace_size for the same parameters.
+ *
+ * The caller owns @p workspace and must keep it alive for the lifetime of
+ * @p ctx.  @ref zxc_cctx_free becomes a no-op for contexts initialised
+ * this way (the workspace is not freed by the library).
+ *
+ * @param[out] ctx               Context to initialise (zeroed on entry).
+ * @param[in]  workspace         Caller-allocated, cache-line-aligned buffer.
+ * @param[in]  workspace_size    Capacity of @p workspace in bytes.
+ * @param[in]  chunk_size        Block size in bytes.
+ * @param[in]  mode              1 = compression, 0 = decompression.
+ * @param[in]  level             Compression level (ignored when @p mode == 0).
+ * @param[in]  checksum_enabled  Non-zero to enable checksum computation.
+ * @return @c ZXC_OK on success, @c ZXC_ERROR_DST_TOO_SMALL if the workspace
+ *         is too small, or another negative @ref zxc_error_t.
+ */
+int zxc_cctx_init_in_workspace(zxc_cctx_t* RESTRICT ctx, void* RESTRICT workspace,
+                               const size_t workspace_size, const size_t chunk_size, const int mode,
+                               const int level, const int checksum_enabled);
+
+/**
+ * @brief Releases the internal buffers owned by a context.
+ *
+ * Does NOT free @p ctx itself - the caller owns the struct storage. The
+ * context may safely be re-initialised with zxc_cctx_init() afterwards.
+ *
+ * @param[in,out] ctx Context whose buffers should be released.
+ */
+void zxc_cctx_free(zxc_cctx_t* ctx);
+
 /**
  * @brief Internal wrapper function to decompress a single chunk of data.
  *
@@ -1525,6 +1706,140 @@ int zxc_decompress_chunk_wrapper(zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRI
  */
 int zxc_compress_chunk_wrapper(zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRICT chunk,
                                const size_t src_sz, uint8_t* RESTRICT dst, const size_t dst_cap);
+
+/* ---------------------------------------------------------------------------
+ * Internal frame primitives.
+ *
+ * Read/write the ZXC file header, block header, and file footer. These were
+ * previously exposed via zxc_sans_io.h but no in-tree consumer outside of the
+ * library implementation needs them, and exposing them freezes on-disk layout
+ * details (block_flags layout, footer composition) that we want to keep free
+ * to evolve until the format is declared stable.
+ * --------------------------------------------------------------------------- */
+
+/**
+ * @brief On-disk header structure for a ZXC block (8 bytes, little-endian).
+ *
+ * @c raw_size is not stored in the header; decoders derive it from Section
+ * Descriptors within the compressed payload.
+ */
+typedef struct {
+    uint8_t block_type;  /**< Block type (see @ref zxc_block_type_t). */
+    uint8_t block_flags; /**< Flags (e.g., checksum presence). */
+    uint8_t reserved;    /**< Reserved for future protocol extensions. */
+    uint8_t header_crc;  /**< Header integrity checksum (1 byte). */
+    uint32_t comp_size;  /**< Compressed size excluding this header. */
+} zxc_block_header_t;
+
+/**
+ * @brief Writes the standard ZXC file header into @p dst.
+ *
+ * Stores the magic word (little-endian) and the version number into the
+ * provided buffer, after checking that it has sufficient capacity.
+ *
+ * @param[out] dst           Destination buffer.
+ * @param[in]  dst_capacity  Total capacity of @p dst in bytes.
+ * @param[in]  chunk_size    Block size to encode in the header.
+ * @param[in]  has_checksum  Non-zero if the checksum bit must be set.
+ *
+ * @return Number of bytes written (@c ZXC_FILE_HEADER_SIZE) on success,
+ *         or @c ZXC_ERROR_DST_TOO_SMALL if @p dst_capacity is insufficient.
+ */
+int zxc_write_file_header(uint8_t* RESTRICT dst, const size_t dst_capacity, const size_t chunk_size,
+                          const int has_checksum);
+
+/**
+ * @brief Validates and reads the ZXC file header from @p src.
+ *
+ * Checks that the source buffer is large enough to contain a ZXC file header
+ * and that the magic word and version number match the expected format.
+ *
+ * @param[in]  src               Pointer to the source buffer.
+ * @param[in]  src_size          Size of the source buffer in bytes.
+ * @param[out] out_block_size    Optional pointer that receives the recommended
+ *                               block size. May be @c NULL.
+ * @param[out] out_has_checksum  Optional pointer that receives the checksum
+ *                               flag. May be @c NULL.
+ *
+ * @return @c ZXC_OK on success, or a negative error code (e.g.
+ *         @c ZXC_ERROR_SRC_TOO_SMALL, @c ZXC_ERROR_BAD_MAGIC,
+ *         @c ZXC_ERROR_BAD_VERSION).
+ */
+int zxc_read_file_header(const uint8_t* RESTRICT src, const size_t src_size, size_t* out_block_size,
+                         int* out_has_checksum);
+
+/**
+ * @brief Encodes a block header into @p dst.
+ *
+ * Serialises the contents of a @ref zxc_block_header_t structure into a byte
+ * array in little-endian format, after checking that @p dst has sufficient
+ * capacity.
+ *
+ * @param[out] dst           Destination buffer.
+ * @param[in]  dst_capacity  Total capacity of @p dst in bytes.
+ * @param[in]  bh            Source block header structure to serialise.
+ *
+ * @return Number of bytes written (@c ZXC_BLOCK_HEADER_SIZE) on success,
+ *         or @c ZXC_ERROR_DST_TOO_SMALL if @p dst_capacity is insufficient.
+ */
+int zxc_write_block_header(uint8_t* RESTRICT dst, const size_t dst_capacity,
+                           const zxc_block_header_t* bh);
+
+/**
+ * @brief Reads and parses a ZXC block header from @p src.
+ *
+ * Extracts the block type, flags, reserved fields, and compressed size from
+ * the first @c ZXC_BLOCK_HEADER_SIZE bytes of @p src. Multi-byte fields are
+ * decoded as little-endian.
+ *
+ * @param[in]  src       Source buffer holding the encoded block header.
+ * @param[in]  src_size  Size of @p src in bytes.
+ * @param[out] bh        Block header structure populated with the parsed data.
+ *
+ * @return @c ZXC_OK on success, or @c ZXC_ERROR_SRC_TOO_SMALL if @p src is
+ *         smaller than @c ZXC_BLOCK_HEADER_SIZE.
+ */
+int zxc_read_block_header(const uint8_t* RESTRICT src, const size_t src_size,
+                          zxc_block_header_t* bh);
+
+/**
+ * @brief Writes the ZXC file footer into @p dst.
+ *
+ * The footer stores the original uncompressed size and an optional global
+ * checksum. It is always @c ZXC_FILE_FOOTER_SIZE (12) bytes long.
+ *
+ * @param[out] dst               Destination buffer.
+ * @param[in]  dst_capacity      Total capacity of @p dst in bytes.
+ * @param[in]  src_size          Original uncompressed size of the data.
+ * @param[in]  global_hash       Global checksum hash (used only when
+ *                               @p checksum_enabled is non-zero).
+ * @param[in]  checksum_enabled  Non-zero if the checksum should be emitted.
+ *
+ * @return Number of bytes written (@c ZXC_FILE_FOOTER_SIZE) on success,
+ *         or @c ZXC_ERROR_DST_TOO_SMALL on failure.
+ */
+int zxc_write_file_footer(uint8_t* RESTRICT dst, const size_t dst_capacity, const uint64_t src_size,
+                          const uint32_t global_hash, const int checksum_enabled);
+
+/* ---------------------------------------------------------------------------
+ * Seekable cross-TU hooks (defined in zxc_seekable.c, consumed by the
+ * FILE*-flavored open helper in zxc_driver.c).
+ * ------------------------------------------------------------------------- */
+
+/**
+ * @brief Hands ownership of a heap-allocated reader context to a seekable
+ *        handle.  The context will be released via @c ZXC_FREE when
+ *        @ref zxc_seekable_free is called on @p s.
+ *
+ * Safe to call exactly once per handle.  Intended for thin wrappers that
+ * build a @ref zxc_reader_t over their own allocated state
+ * (@ref zxc_seekable_open_file) and need that state to outlive the call
+ * site.
+ *
+ * @param[in,out] s    Seekable handle returned by @ref zxc_seekable_open_reader.
+ * @param[in]     ctx  Pointer previously returned by @c ZXC_MALLOC / @c ZXC_CALLOC.
+ */
+void zxc_seekable_attach_owned_ctx(zxc_seekable* s, void* ctx);
 
 /** @} */ /* end of internal */
 
