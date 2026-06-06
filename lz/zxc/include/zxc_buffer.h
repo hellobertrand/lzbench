@@ -167,6 +167,18 @@ ZXC_EXPORT int64_t zxc_decompress(const void* src, const size_t src_size, void* 
  */
 ZXC_EXPORT uint64_t zxc_get_decompressed_size(const void* src, const size_t src_size);
 
+/**
+ * @brief Returns the dictionary ID stored in a ZXC compressed buffer.
+ *
+ * Reads the file header flag and dict_id field without decompressing.
+ * Returns 0 if the file does not require a dictionary or the buffer is invalid.
+ *
+ * @param[in] src       Pointer to the compressed data buffer.
+ * @param[in] src_size  Size of the compressed data in bytes.
+ * @return Dictionary ID, or 0 if no dictionary is required.
+ */
+ZXC_EXPORT uint32_t zxc_get_dict_id(const void* src, size_t src_size);
+
 /* ========================================================================= */
 /*  Block-Level API (no file framing)                                        */
 /* ========================================================================= */
@@ -202,7 +214,9 @@ ZXC_EXPORT uint64_t zxc_get_decompressed_size(const void* src, const size_t src_
  */
 
 /* Forward declarations for context types (defined below). */
+/** @brief Opaque reusable compression context (see @ref zxc_create_cctx). */
 typedef struct zxc_cctx_s zxc_cctx;
+/** @brief Opaque reusable decompression context (see @ref zxc_create_dctx). */
 typedef struct zxc_dctx_s zxc_dctx;
 
 /**
@@ -311,7 +325,7 @@ ZXC_EXPORT int64_t zxc_decompress_block(zxc_dctx* dctx, const void* src, size_t 
  * because it avoids the wild-copy overshoot that the fast decoder relies on.
  * Output is bit-identical to zxc_decompress_block().
  *
- * NUM and RAW blocks transparently forward to zxc_decompress_block(); only
+ * RAW blocks transparently forward to zxc_decompress_block(); only
  * GLO/GHI use the strict-tail decoder path.
  *
  * Strict-tail variant: @p dst_capacity is the exact uncompressed size with

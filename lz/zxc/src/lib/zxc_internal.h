@@ -16,7 +16,7 @@
  * - Endianness detection and byte-swap helpers.
  * - File-format constants (magic word, header sizes, block sizes, ...).
  * - Inline helpers for hashing, endian-safe loads/stores, bit manipulation,
- *   ZigZag encoding, aligned allocation, and bitstream reading.
+ *   aligned allocation, and bitstream reading.
  * - Internal function prototypes for chunk-level compression/decompression.
  *
  * @warning Do not include this header from user code; use the public headers
@@ -32,6 +32,7 @@
 
 #include "../../include/zxc_buffer.h"
 #include "../../include/zxc_constants.h"
+#include "../../include/zxc_error.h"
 #include "../../include/zxc_seekable.h"
 #include "rapidhash.h"
 
@@ -186,6 +187,11 @@ extern "C" {
  */
 #define ZXC_ALWAYS_INLINE inline __attribute__((always_inline))
 
+/** @def ZXC_NOINLINE
+ * @brief Prevents a function from being inlined into its callers.
+ */
+#define ZXC_NOINLINE __attribute__((noinline))
+
 #elif defined(_MSC_VER)
 #include <intrin.h>
 #if defined(_M_IX86) || defined(_M_X64) || defined(_M_AMD64)
@@ -213,6 +219,11 @@ extern "C" {
  * @brief Forces a function to be inlined at all optimization levels (MSVC).
  */
 #define ZXC_ALWAYS_INLINE __forceinline
+
+/** @def ZXC_NOINLINE
+ * @brief Prevents a function from being inlined into its callers (MSVC).
+ */
+#define ZXC_NOINLINE __declspec(noinline)
 #pragma intrinsic(_BitScanReverse)
 #else
 #define LIKELY(x) (x)
@@ -227,6 +238,11 @@ extern "C" {
  * @brief Forces a function to be inlined (fallback for non-GCC/Clang/MSVC compilers).
  */
 #define ZXC_ALWAYS_INLINE inline
+
+/** @def ZXC_NOINLINE
+ * @brief Prevents inlining (best-effort no-op fallback for unknown compilers).
+ */
+#define ZXC_NOINLINE
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 #include <stdalign.h>
@@ -301,8 +317,9 @@ extern "C" {
 
 /** @brief Magic word identifying ZXC files (little-endian 0x9CB02EF5). */
 #define ZXC_MAGIC_WORD 0x9CB02EF5U
-/** @brief Current on-disk file format version. */
-#define ZXC_FILE_FORMAT_VERSION 5
+/** @brief Current on-disk file format version. The decoder accepts only this
+ *  version; Older versions are rejected with ZXC_ERROR_BAD_VERSION. */
+#define ZXC_FILE_FORMAT_VERSION 6
 
 /** @brief Safety padding appended to buffers to tolerate overruns. */
 #define ZXC_PAD_SIZE 32
@@ -334,15 +351,33 @@ extern "C" {
 
 /** @brief Bit flag in the Flags byte indicating checksum presence (bit 7). */
 #define ZXC_FILE_FLAG_HAS_CHECKSUM 0x80U
+/** @brief Bit flag in the Flags byte indicating a dictionary is required (bit 6). */
+#define ZXC_FILE_FLAG_HAS_DICTIONARY 0x40U
 /** @brief Mask for the checksum algorithm id (bits 0-3). */
 #define ZXC_FILE_CHECKSUM_ALGO_MASK 0x0FU
+
+/** @brief Magic word identifying ZXC dictionary files (.zxd). */
+#define ZXC_DICT_MAGIC 0x9CB0D1C7U
+/** @brief Current dictionary file format version. */
+#define ZXC_DICT_VERSION 1
+/** @brief K-gram length scanned by the dictionary trainer. Aligned on the LZ
+ *         minimum match length so trained patterns are matchable at encode time. */
+#define ZXC_DICT_KGRAM_LEN ZXC_LZ_MIN_MATCH_LEN
+/** @brief Address bits for the dictionary trainer's k-gram frequency table. */
+#define ZXC_DICT_HASH_BITS 16
+/** @brief Maximum number of candidate segments the dictionary trainer keeps. */
+#define ZXC_DICT_MAX_SEGMENTS (1U << 16)
+/** @brief Target number of sampled k-gram positions for the trainer's frequency
+ *  estimate. Bounds the count so 16-bit counters stay unsaturated on large
+ *  corpora; the trainer strides the corpus to hit roughly this many positions. */
+#define ZXC_DICT_SAMPLE_TARGET (1U << 19)
+/** @brief Number of buckets in the dictionary trainer's frequency table. */
+#define ZXC_DICT_HASH_SIZE (1U << ZXC_DICT_HASH_BITS)
 
 /** @brief Block header size: Type(1)+Flags(1)+Reserved(1)+CRC(1)+CompSize(4). */
 #define ZXC_BLOCK_HEADER_SIZE 8
 /** @brief Size of the per-block checksum field in bytes. */
 #define ZXC_BLOCK_CHECKSUM_SIZE 4
-/** @brief Binary size of a NUM block sub-header. */
-#define ZXC_NUM_HEADER_BINARY_SIZE 16
 /** @brief Binary size of a GLO block sub-header. */
 #define ZXC_GLO_HEADER_BINARY_SIZE 16
 /** @brief Binary size of a GHI block sub-header. */
@@ -356,14 +391,6 @@ extern "C" {
  *  evolution. Used by zxc_compress_block_bound() and zxc_compress_bound()
  *  to size the destination buffer in the worst (incompressible) case. */
 #define ZXC_BLOCK_FORMAT_OVERHEAD 64
-
-/** @brief Binary size of a NUM chunk sub-frame header (nvals + bits + base + psize). */
-#define ZXC_NUM_CHUNK_HEADER_SIZE 16
-/** @brief Number of numeric values to decode in a single SIMD batch (NUM block). */
-#define ZXC_NUM_DEC_BATCH 32
-/** @brief Maximum number of frames that can be processed in a single compression operation (NUM
- * block). */
-#define ZXC_NUM_FRAME_SIZE 128
 
 /** @brief Binary size of a section descriptor (comp_size + raw_size). */
 #define ZXC_SECTION_DESC_BINARY_SIZE 8
@@ -386,7 +413,7 @@ extern "C" {
  *  The seek table is optional (opt-in at compression time) and allows
  *  random-access decompression by recording per-block compressed and
  *  decompressed sizes.  It uses a standard ZXC block header with
- *  @c block_type = @ref ZXC_BLOCK_SEK.
+ *  @c block_type = @c ZXC_BLOCK_SEK.
  *
  *  Detection from the end of the file: the reader derives @c num_blocks
  *  from the file footer (total decompressed size) and file header (block size).
@@ -481,6 +508,9 @@ extern "C" {
 #define ZXC_LZ_OFFSET_BIAS 1
 /** @brief Maximum allowed offset distance. */
 #define ZXC_LZ_MAX_DIST (ZXC_LZ_WINDOW_SIZE - 1)
+/** @brief Bytes at the block end where match search stops (left as literals).
+ *  Equals the 8-byte word the finder reads at each probe, so @c ip+8<=iend. */
+#define ZXC_LZ_SEARCH_MARGIN (sizeof(uint64_t))
 /** @} */
 
 /** @name Optimal Parser Tuning (level >= 6)
@@ -578,19 +608,23 @@ extern "C" {
  *         @c ZXC_HUF_BATCH iterations before re-checking the bound. */
 #define ZXC_HUF_SAFE_MARGIN ((size_t)(2 * ZXC_HUF_BATCH))
 
-/* Boundary package-merge work item. Each level holds at most
- * `2 * ZXC_HUF_NUM_SYMBOLS` of these; exposed so callers can size
- * pre-allocated scratch via ::ZXC_HUF_BUILD_SCRATCH_SIZE. */
+/**
+ * @brief Boundary package-merge work item.
+ *
+ * Each level holds at most `2 * ZXC_HUF_NUM_SYMBOLS` of these; exposed so
+ * callers can size pre-allocated scratch via ::ZXC_HUF_BUILD_SCRATCH_SIZE.
+ */
 typedef struct {
-    uint32_t weight;
-    int16_t left, right;
-    int16_t sym;
+    uint32_t weight; /**< Accumulated weight (summed frequency) of the package. */
+    int16_t left;    /**< Left child index, or -1 for a leaf. */
+    int16_t right;   /**< Right child index, or -1 for a leaf. */
+    int16_t sym;     /**< Symbol index for a leaf, or -1 for an internal node. */
 } zxc_huf_pm_item_t;
 
-/* Trace-back stack frame for the package-merge code-length recovery. */
+/** @brief Trace-back stack frame for the package-merge code-length recovery. */
 typedef struct {
-    int8_t lvl;
-    int16_t idx;
+    int8_t lvl;  /**< Package-merge level being traced back. */
+    int16_t idx; /**< Item index within that level. */
 } zxc_huf_pm_frame_t;
 
 /** @brief Per-level item bound: at most leaves + paired packages from the
@@ -628,6 +662,7 @@ static ZXC_ALWAYS_INLINE uint32_t zxc_log2_u32(const uint32_t v) {
 /**
  * @brief Branchless bit_ceil: smallest power of two >= v, clamped to ZXC_BLOCK_SIZE_MIN.
  * @param[in] v Input size (must be > 0).
+ * @return Smallest power of two >= @p v, clamped up to @ref ZXC_BLOCK_SIZE_MIN.
  */
 static ZXC_ALWAYS_INLINE size_t zxc_block_size_ceil(const size_t v) {
     uint64_t x = (uint64_t)v - 1;
@@ -735,9 +770,7 @@ static ZXC_ALWAYS_INLINE zxc_lz77_params_t zxc_get_lz77_params(const int level) 
  * entropy) or when compression would expand the data size.
  * - `ZXC_BLOCK_GLO` (1): General-purpose compression (LZ77 + Bitpacking). This
  * is the default for most data (text, binaries, JSON, etc.). Includes 4 sections descriptors.
- * - `ZXC_BLOCK_NUM` (2): Specialized compression for arrays of 32-bit integers.
- *   Uses Delta Encoding + ZigZag + Bitpacking.
- * - `ZXC_BLOCK_GHI` (3): General-purpose high-velocity mode using LZ77 with advanced
+ * - `ZXC_BLOCK_GHI` (2): General-purpose high-velocity mode using LZ77 with advanced
  * techniques (lazy matching, step skipping) for maximum ratio. Includes 3 sections descriptors.
  * - `ZXC_BLOCK_SEK` (254): Seek table block. Contains per-block compressed/decompressed sizes
  *   for random-access decompression. Placed between EOF block and file footer.
@@ -746,8 +779,7 @@ static ZXC_ALWAYS_INLINE zxc_lz77_params_t zxc_get_lz77_params(const int level) 
 typedef enum {
     ZXC_BLOCK_RAW = 0,
     ZXC_BLOCK_GLO = 1,
-    ZXC_BLOCK_NUM = 2,
-    ZXC_BLOCK_GHI = 3,
+    ZXC_BLOCK_GHI = 2,
     ZXC_BLOCK_SEK = 254,
     ZXC_BLOCK_EOF = 255
 } zxc_block_type_t;
@@ -809,22 +841,6 @@ typedef struct {
 typedef struct {
     uint64_t sizes; /**< Packed sizes: compressed size (low 32 bits) | raw size (high 32 bits). */
 } zxc_section_desc_t;
-
-/**
- * @struct zxc_num_header_t
- * @brief Header specific to Numeric compression blocks.
- *
- * This header follows the main block header when the block type is NUM.
- *
- * @var zxc_num_header_t::n_values
- * The total number of numeric values encoded in the block.
- * @var zxc_num_header_t::frame_size
- * The size of the frame used for processing.
- */
-typedef struct {
-    uint64_t n_values;
-    uint16_t frame_size;
-} zxc_num_header_t;
 
 /**
  * @struct zxc_bit_reader_t
@@ -1129,65 +1145,6 @@ static ZXC_ALWAYS_INLINE int zxc_ctz64(const uint64_t x) {
 }
 
 /**
- * @brief Calculates the index of the highest set bit (most significant bit) in a 32-bit integer.
- *
- * This function determines the position of the most significant bit that is set to 1.
- *
- * @param[in] n The 32-bit unsigned integer to analyze.
- * @return The 0-based index of the highest set bit. If n is 0, the behavior is undefined.
- */
-static ZXC_ALWAYS_INLINE uint8_t zxc_highbit32(const uint32_t n) {
-#ifdef _MSC_VER
-    unsigned long index;
-    return (n == 0) ? 0 : (_BitScanReverse(&index, n) ? (uint8_t)(index + 1) : 0);
-#else
-    return (n == 0) ? 0 : (32 - __builtin_clz(n));
-#endif
-}
-
-/**
- * @brief Encodes a signed 32-bit integer using ZigZag encoding.
- *
- * ZigZag encoding maps signed integers to unsigned integers so that numbers with a small
- * absolute value (for instance, -1) have a small variant encoded value too. It does this
- * by "zig-zagging" back and forth through the positive and negative integers:
- *
- *  0 => 0
- * -1 => 1
- *  1 => 2
- * -2 => 3
- *  2 => 4
- *
- * This is particularly useful for variable-length encoding (varint) of signed integers,
- * as standard varint encoding is inefficient for negative numbers (which are interpreted
- * as very large unsigned integers).
- *
- * @param[in] n The signed 32-bit integer to encode.
- * @return The ZigZag encoded unsigned 32-bit integer.
- */
-static ZXC_ALWAYS_INLINE uint32_t zxc_zigzag_encode(const int32_t n) {
-    return ((uint32_t)n << 1) ^ (uint32_t)(-(int32_t)((uint32_t)n >> 31));
-}
-
-/**
- * @brief Decodes a 32-bit unsigned integer using ZigZag decoding.
- *
- * ZigZag encoding maps signed integers to unsigned integers so that numbers with a small
- * absolute value (for instance, -1) have a small variant encoded value too. It does this
- * by "zig-zagging" back and forth through the positive and negative integers:
- * 0 => 0, -1 => 1, 1 => 2, -2 => 3, 2 => 4, etc.
- *
- * This function reverses that process, converting the unsigned representation back into
- * the original signed 32-bit integer.
- *
- * @param[in] n The unsigned 32-bit integer to decode.
- * @return The decoded signed 32-bit integer.
- */
-static ZXC_ALWAYS_INLINE int32_t zxc_zigzag_decode(const uint32_t n) {
-    return (int32_t)(n >> 1) ^ -(int32_t)(n & 1);
-}
-
-/**
  * @brief Allocates aligned memory in a cross-platform manner.
  *
  * This function provides a unified interface for allocating memory with a specific
@@ -1308,100 +1265,6 @@ static ZXC_ALWAYS_INLINE void zxc_br_init(zxc_bit_reader_t* RESTRICT br,
         br->bits = sizeof(uint64_t) * CHAR_BIT;
     }
 }
-
-/**
- * @brief Ensures that the bit reader buffer contains at least the specified
- * number of bits.
- *
- * This function checks if the internal buffer of the bit reader has enough bits
- * available to satisfy a subsequent read operation of `needed` bits. If not, it
- * refills the buffer from the source.
- *
- * @param[in,out] br Pointer to the bit reader context.
- * @param[in] needed The number of bits required to be available in the buffer.
- */
-static ZXC_ALWAYS_INLINE void zxc_br_ensure(zxc_bit_reader_t* RESTRICT br, const int needed) {
-    if (UNLIKELY(br->bits < needed)) {
-        const int safe_bits = (br->bits < 0) ? 0 : br->bits;
-        br->bits = safe_bits;
-
-        // Mask out garbage bits (retain only valid existing bits)
-#if !defined(ZXC_DISABLE_SIMD) && defined(__BMI2__) && (defined(__x86_64__) || defined(_M_X64))
-        br->accum = _bzhi_u64(br->accum, safe_bits);
-#else
-        br->accum &= (safe_bits < 64) ? ((1ULL << safe_bits) - 1) : ~0ULL;
-#endif
-
-        // Calculate how many bytes we can read
-        // We want to fill up to the accumulation capability (64 bits for uint64_t)
-        // Bytes needed = (capacity_bits - safe_bits) / 8
-        const int bytes_needed = ((int)(sizeof(uint64_t) * CHAR_BIT) - safe_bits) / CHAR_BIT;
-
-        // Bounds check: zxc_le64 always reads 8 bytes, so we need at least 8
-        const size_t bytes_left = (size_t)(br->end - br->ptr);
-        if (UNLIKELY(bytes_left < sizeof(uint64_t))) {
-            // Partial read (slow path / end of stream)
-            const size_t to_read =
-                (bytes_left < (size_t)bytes_needed) ? bytes_left : (size_t)bytes_needed;
-            const uint64_t raw = zxc_le_partial(br->ptr, to_read);
-            br->accum |= (safe_bits < 64) ? (raw << safe_bits) : 0;
-            br->ptr += to_read;
-            br->bits = safe_bits + (int)to_read * CHAR_BIT;
-        } else {
-            // Fast path: full 8-byte read is safe
-            const uint64_t raw = zxc_le64(br->ptr);
-            br->accum |= (safe_bits < 64) ? (raw << safe_bits) : 0;
-            br->ptr += bytes_needed;
-            br->bits = safe_bits + bytes_needed * CHAR_BIT;
-        }
-    }
-}
-
-/**
- * @brief Bit-packs a stream of 32-bit integers into a destination buffer.
- *
- * Compresses an array of 32-bit integers by packing them using a specified
- * number of bits per integer.
- *
- * @param[in] src Pointer to the source array of 32-bit integers.
- * @param[in] count The number of integers to pack.
- * @param[out] dst Pointer to the destination buffer where packed data will be
- * written.
- * @param[in] dst_cap The capacity of the destination buffer in bytes.
- * @param[in] bits The number of bits to use for each integer during packing.
- * @return int The number of bytes written to the destination buffer, or a negative
- * error code on failure.
- */
-int zxc_bitpack_stream_32(const uint32_t* RESTRICT src, const size_t count, uint8_t* RESTRICT dst,
-                          const size_t dst_cap, const uint8_t bits);
-
-/**
- * @brief Writes a numeric header structure to a destination buffer.
- *
- * Serializes the `zxc_num_header_t` structure into the output stream.
- *
- * @param[out] dst Pointer to the destination buffer.
- * @param[in] rem The remaining space in the destination buffer.
- * @param[in] nh Pointer to the numeric header structure to write.
- * @return int The number of bytes written, or a negative error code if the buffer
- * is too small.
- */
-int zxc_write_num_header(uint8_t* RESTRICT dst, const size_t rem,
-                         const zxc_num_header_t* RESTRICT nh);
-
-/**
- * @brief Reads a numeric header structure from a source buffer.
- *
- * Deserializes data from the input stream into a `zxc_num_header_t` structure.
- *
- * @param[in] src Pointer to the source buffer.
- * @param[in] src_size The size of the source buffer available for reading.
- * @param[out] nh Pointer to the numeric header structure to populate.
- * @return int The number of bytes read from the source, or a negative error code on
- * failure.
- */
-int zxc_read_num_header(const uint8_t* RESTRICT src, const size_t src_size,
-                        zxc_num_header_t* RESTRICT nh);
 
 /**
  * @brief Writes a generic header and section descriptors to a destination
@@ -1584,6 +1447,10 @@ typedef struct {
     size_t opt_scratch_cap; /**< Current capacity of opt_scratch in bytes. */
     int checksum_enabled;   /**< 1 if checksum calculation/verification is enabled. */
     int compression_level;  /**< Compression level. */
+    size_t dict_size;       /**< Dictionary prefill size (0 = no dictionary). */
+    uint8_t* dict_buffer;   /**< [dict | data] concat scratch carved from memory_block
+                                 when dict_size > 0 (NULL otherwise). */
+    size_t dict_buffer_cap; /**< Capacity of dict_buffer in bytes (0 = none). */
 
     /* Block-size derived parameters (computed once at init). */
     size_t chunk_size;    /**< Effective block size in bytes. */
@@ -1603,12 +1470,15 @@ typedef struct {
  * @param[in]  mode              1 for compression, 0 for decompression.
  * @param[in]  level             Compression level (ignored when @p mode == 0).
  * @param[in]  checksum_enabled  Non-zero to enable checksum computation.
+ * @param[in]  dict_size         Dictionary prefill size; when > 0 an extra
+ *                               [dict | data] concat buffer is carved into the
+ *                               workspace and @c ctx->dict_buffer is set.
  *
  * @return @c ZXC_OK on success, or a negative @ref zxc_error_t code (notably
  *         @c ZXC_ERROR_MEMORY on allocation failure).
  */
 int zxc_cctx_init(zxc_cctx_t* ctx, const size_t chunk_size, const int mode, const int level,
-                  const int checksum_enabled);
+                  const int checksum_enabled, const size_t dict_size);
 
 /**
  * @brief Returns the byte count that @ref zxc_cctx_init would allocate for
@@ -1621,9 +1491,12 @@ int zxc_cctx_init(zxc_cctx_t* ctx, const size_t chunk_size, const int mode, cons
  *                        @ref zxc_validate_block_size).
  * @param[in] mode        1 = compression, 0 = decompression.
  * @param[in] level       Compression level (only consulted when @p mode == 1).
+ * @param[in] dict_size   Dictionary prefill size; when > 0 the figure includes
+ *                        the [dict | data] concat buffer.
  * @return Size in bytes, or 0 if the parameters are invalid.
  */
-size_t zxc_cctx_compute_workspace_size(const size_t chunk_size, const int mode, const int level);
+size_t zxc_cctx_compute_workspace_size(const size_t chunk_size, const int mode, const int level,
+                                       const size_t dict_size);
 
 /**
  * @brief Initialises a compression / decompression context inside a
@@ -1645,12 +1518,15 @@ size_t zxc_cctx_compute_workspace_size(const size_t chunk_size, const int mode, 
  * @param[in]  mode              1 = compression, 0 = decompression.
  * @param[in]  level             Compression level (ignored when @p mode == 0).
  * @param[in]  checksum_enabled  Non-zero to enable checksum computation.
+ * @param[in]  dict_size         Dictionary prefill size; when > 0 the workspace
+ *                               must include the [dict | data] concat buffer and
+ *                               @c ctx->dict_buffer is set into it.
  * @return @c ZXC_OK on success, @c ZXC_ERROR_DST_TOO_SMALL if the workspace
  *         is too small, or another negative @ref zxc_error_t.
  */
 int zxc_cctx_init_in_workspace(zxc_cctx_t* RESTRICT ctx, void* RESTRICT workspace,
                                const size_t workspace_size, const size_t chunk_size, const int mode,
-                               const int level, const int checksum_enabled);
+                               const int level, const int checksum_enabled, const size_t dict_size);
 
 /**
  * @brief Releases the internal buffers owned by a context.
@@ -1682,8 +1558,11 @@ void zxc_cctx_free(zxc_cctx_t* ctx);
  *                Specific error codes depend on the underlying ZXC
  * implementation.
  */
-int zxc_decompress_chunk_wrapper(zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRICT src,
+int zxc_decompress_chunk_wrapper(const zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRICT src,
                                  const size_t src_sz, uint8_t* RESTRICT dst, const size_t dst_cap);
+int zxc_decompress_chunk_wrapper_dict(const zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRICT src,
+                                      const size_t src_sz, uint8_t* RESTRICT dst,
+                                      const size_t dst_cap);
 
 /**
  * @brief Wraps the internal chunk compression logic.
@@ -1741,12 +1620,13 @@ typedef struct {
  * @param[in]  dst_capacity  Total capacity of @p dst in bytes.
  * @param[in]  chunk_size    Block size to encode in the header.
  * @param[in]  has_checksum  Non-zero if the checksum bit must be set.
+ * @param[in]  dict_id       Dictionary ID (0 = no dictionary).
  *
  * @return Number of bytes written (@c ZXC_FILE_HEADER_SIZE) on success,
  *         or @c ZXC_ERROR_DST_TOO_SMALL if @p dst_capacity is insufficient.
  */
 int zxc_write_file_header(uint8_t* RESTRICT dst, const size_t dst_capacity, const size_t chunk_size,
-                          const int has_checksum);
+                          const int has_checksum, const uint32_t dict_id);
 
 /**
  * @brief Validates and reads the ZXC file header from @p src.
@@ -1760,13 +1640,15 @@ int zxc_write_file_header(uint8_t* RESTRICT dst, const size_t dst_capacity, cons
  *                               block size. May be @c NULL.
  * @param[out] out_has_checksum  Optional pointer that receives the checksum
  *                               flag. May be @c NULL.
+ * @param[out] out_dict_id       Optional pointer that receives the dictionary
+ *                               ID (0 if none). May be @c NULL.
  *
  * @return @c ZXC_OK on success, or a negative error code (e.g.
  *         @c ZXC_ERROR_SRC_TOO_SMALL, @c ZXC_ERROR_BAD_MAGIC,
  *         @c ZXC_ERROR_BAD_VERSION).
  */
 int zxc_read_file_header(const uint8_t* RESTRICT src, const size_t src_size, size_t* out_block_size,
-                         int* out_has_checksum);
+                         int* out_has_checksum, uint32_t* out_dict_id);
 
 /**
  * @brief Encodes a block header into @p dst.
