@@ -543,7 +543,7 @@ ifeq "$(DONT_BUILD_ZXC)" "1"
 else
     DEFINES += -DZXC_STATIC_DEFINE
     ZXC_DIR = lz/zxc/src/lib
-    ZXC_FILES = $(ZXC_DIR)/zxc_common.o $(ZXC_DIR)/zxc_dispatch.o $(ZXC_DIR)/zxc_driver.o $(ZXC_DIR)/zxc_pstream.o $(ZXC_DIR)/zxc_seekable.o
+    ZXC_FILES = $(ZXC_DIR)/zxc_common.o $(ZXC_DIR)/zxc_dict.o $(ZXC_DIR)/zxc_dispatch.o $(ZXC_DIR)/zxc_driver.o $(ZXC_DIR)/zxc_pstream.o $(ZXC_DIR)/zxc_seekable.o
     ZXC_FILES += $(ZXC_DIR)/zxc_compress_default.o $(ZXC_DIR)/zxc_decompress_default.o $(ZXC_DIR)/zxc_huffman_default.o
 
     ifneq (,$(filter x86_64% amd64% i%86%,$(TARGET_ARCH)))
