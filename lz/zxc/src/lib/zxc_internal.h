@@ -614,6 +614,13 @@ extern "C" {
 #define ZXC_HUF_BATCH_BITS (ZXC_HUF_BATCH * ZXC_HUF_LOOKUP_BITS)
 /** @brief Mask for indexing into the multi-symbol decoder lookup table. */
 #define ZXC_HUF_TBL_MASK ((uint64_t)(ZXC_HUF_DEC_TABLE_SIZE - 1))
+/** @brief Decode-table index: the low @ref ZXC_HUF_LOOKUP_BITS of the bit
+ *         accumulator. */
+#if defined(__BMI2__) && !defined(ZXC_DISABLE_SIMD)
+#define ZXC_HUF_LUT_IDX(a) ((size_t)_bzhi_u64((uint64_t)(a), ZXC_HUF_LOOKUP_BITS))
+#else
+#define ZXC_HUF_LUT_IDX(a) ((size_t)((a) & ZXC_HUF_TBL_MASK))
+#endif
 /** @brief Per-stream output headroom required to enter the batched fast loop:
  *         each iteration speculatively writes 2 bytes per stream and runs
  *         @c ZXC_HUF_BATCH iterations before re-checking the bound. */
