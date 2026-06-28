@@ -432,12 +432,7 @@ int64_t zxc_cstream_compress(zxc_cstream* cs, zxc_outbuf_t* out, zxc_inbuf_t* in
                 break;
             }
 
-            case CS_DRAIN_HEADER: {
-                if (!cs_drain_pending(cs, out)) return (int64_t)(cs->pending_len - cs->pending_pos);
-                cs->state = CS_ACCUMULATE;
-                break;
-            }
-
+            case CS_DRAIN_HEADER:
             case CS_DRAIN_BLOCK: {
                 if (!cs_drain_pending(cs, out)) return (int64_t)(cs->pending_len - cs->pending_pos);
                 cs->state = CS_ACCUMULATE;
@@ -641,8 +636,8 @@ typedef enum {
  * @var zxc_dstream_s::file_has_checksum
  *      File-level checksum flag declared by the file header.
  * @var zxc_dstream_s::scratch
- *      Generic accumulator for fixed-size frames; sized for the largest
- *      (file header = 16 bytes).
+ *      Generic 32-byte accumulator for fixed-size frames (file header, block
+ *      header, footer); comfortably holds the largest (16-byte file header).
  * @var zxc_dstream_s::scratch_used
  *      Number of bytes currently held in @c scratch.
  * @var zxc_dstream_s::scratch_need

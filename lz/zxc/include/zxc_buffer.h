@@ -18,13 +18,13 @@
  * // Compress
  * size_t bound = zxc_compress_bound(src_size);
  * void *dst    = malloc(bound);
- * zxc_compress_opts_t opts = { .level = ZXC_LEVEL_DEFAULT, .checksum = 1 };
+ * zxc_compress_opts_t opts = { .level = ZXC_LEVEL_DEFAULT, .checksum_enabled = 1 };
  * int64_t csize = zxc_compress(src, src_size, dst, bound, &opts);
  *
  * // Decompress
  * uint64_t orig = zxc_get_decompressed_size(dst, csize);
  * void *out     = malloc(orig);
- * zxc_decompress_opts_t dopts = { .checksum = 1 };
+ * zxc_decompress_opts_t dopts = { .checksum_enabled = 1 };
  * int64_t dsize = zxc_decompress(dst, csize, out, orig, &dopts);
  * @endcode
  *
@@ -86,7 +86,7 @@ ZXC_EXPORT int zxc_default_level(void);
  * @brief Returns the human-readable library version string.
  *
  * The returned pointer is a compile-time constant and must not be freed.
- * Example: "0.9.1".
+ * Format: "MAJOR.MINOR.PATCH" (e.g. "0.12.0").
  *
  * @return Null-terminated version string.
  */
@@ -125,7 +125,10 @@ ZXC_EXPORT uint64_t zxc_compress_bound(const size_t input_size);
  * @param[out] dst          Pointer to the destination buffer.
  * @param[in] dst_capacity Maximum capacity of the destination buffer.
  * @param[in] opts         Compression options (NULL uses all defaults).
- *                         Only @c level, @c block_size, and @c checksum are used.
+ *                         @c n_threads and the progress callback are ignored
+ *                         (this call is single-threaded and blocking).
+ *
+ * @note @p src and @p dst must not overlap (same contract as memcpy).
  *
  * @return The number of bytes written to dst (>0 on success),
  *         or a negative zxc_error_t code (e.g., ZXC_ERROR_DST_TOO_SMALL) on failure.
@@ -145,7 +148,10 @@ ZXC_EXPORT int64_t zxc_compress(const void* src, const size_t src_size, void* ds
  * @param[out] dst          Pointer to the destination buffer.
  * @param[in] dst_capacity  Capacity of the destination buffer.
  * @param[in] opts          Decompression options (NULL uses all defaults).
- *                          Only @c checksum is used.
+ *                          @c n_threads and the progress callback are ignored
+ *                          (this call is single-threaded and blocking).
+ *
+ * @note @p src and @p dst must not overlap (same contract as memcpy).
  *
  * @return The number of bytes written to dst (>0 on success),
  *         or a negative zxc_error_t code (e.g., ZXC_ERROR_CORRUPT_DATA) on failure.
@@ -277,6 +283,8 @@ ZXC_EXPORT uint64_t zxc_decompress_block_bound(const size_t uncompressed_size);
  *                             Only @c level, @c block_size, and
  *                             @c checksum_enabled are used.
  *
+ * @note @p src and @p dst must not overlap (same contract as memcpy).
+ *
  * @return Compressed block size in bytes (> 0) on success,
  *         or a negative @ref zxc_error_t code on failure.
  *         Returns @ref ZXC_ERROR_BAD_BLOCK_SIZE if
@@ -305,6 +313,8 @@ ZXC_EXPORT int64_t zxc_compress_block(zxc_cctx* cctx, const void* src, size_t sr
  * @param[in]     opts         Decompression options (NULL for defaults).
  *                             Only @c checksum_enabled is used.
  *
+ * @note @p src and @p dst must not overlap (same contract as memcpy).
+ *
  * @return Decompressed size in bytes (> 0) on success,
  *         or a negative @ref zxc_error_t code on failure.
  *         Returns @ref ZXC_ERROR_BAD_BLOCK_SIZE if @p dst_capacity exceeds
@@ -319,7 +329,9 @@ ZXC_EXPORT int64_t zxc_decompress_block(zxc_dctx* dctx, const void* src, size_t 
  * Identical semantics to zxc_decompress_block() but accepts
  * @p dst_capacity == @c uncompressed_size (no trailing @c ZXC_DECOMPRESS_TAIL_PAD
  * required). Intended for integrations whose destination buffer cannot be
- * oversized (for example, in-place page-aligned decoding).
+ * oversized (for example, decoding into an exactly-sized, page-aligned
+ * region). Here "in-place" means a tightly-sized destination, not an
+ * overlapping @p src / @p dst (see @note below).
  *
  * This path is slightly slower than zxc_decompress_block() on the same input
  * because it avoids the wild-copy overshoot that the fast decoder relies on.
@@ -343,6 +355,8 @@ ZXC_EXPORT int64_t zxc_decompress_block(zxc_dctx* dctx, const void* src, size_t 
  *                             margin is required).
  * @param[in]     opts         Decompression options (NULL for defaults).
  *                             Only @c checksum_enabled is used.
+ *
+ * @note @p src and @p dst must not overlap (same contract as memcpy).
  *
  * @return Decompressed size in bytes (> 0) on success,
  *         or a negative @ref zxc_error_t code on failure.
@@ -437,6 +451,8 @@ ZXC_EXPORT void zxc_free_cctx(zxc_cctx* cctx);
  * @param[in]     opts         Compression options, or NULL to reuse
  *                             settings from create / last call.
  *
+ * @note @p src and @p dst must not overlap (same contract as memcpy).
+ *
  * @return Compressed size in bytes (> 0) on success,
  *         or a negative @ref zxc_error_t code on failure.
  */
@@ -472,6 +488,8 @@ ZXC_EXPORT void zxc_free_dctx(zxc_dctx* dctx);
  * @param[out]    dst          Destination buffer.
  * @param[in]     dst_capacity Capacity of the destination buffer.
  * @param[in]     opts         Decompression options (NULL for defaults).
+ *
+ * @note @p src and @p dst must not overlap (same contract as memcpy).
  *
  * @return Decompressed size in bytes (> 0) on success,
  *         or a negative @ref zxc_error_t code on failure.

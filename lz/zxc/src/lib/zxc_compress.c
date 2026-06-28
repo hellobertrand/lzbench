@@ -296,8 +296,8 @@ static ZXC_ALWAYS_INLINE zxc_match_t zxc_lz77_find_best_match(
         attempts--;
     }
 
-    while (match_idx > 0 && attempts-- >= 0) {
-        if (UNLIKELY(cur_pos - match_idx > ZXC_LZ_MAX_DIST)) break;
+    while (match_idx > 0) {
+        if (UNLIKELY(attempts-- < 0 || cur_pos - match_idx > ZXC_LZ_MAX_DIST)) break;
         const uint8_t* ref = src + match_idx;
 
         // Load the next chain link early (before the compare) so its address
@@ -498,8 +498,9 @@ _finalize_match:
         int lazy_att = p.lazy_attempts;
         int is_lazy_first = 1;
 
-        while (next_idx > 0 && lazy_att-- > 0) {
-            if (UNLIKELY((uint32_t)(ip + 1 - src) - next_idx > ZXC_LZ_MAX_DIST)) break;
+        while (next_idx > 0) {
+            if (UNLIKELY(lazy_att-- <= 0 || (uint32_t)(ip + 1 - src) - next_idx > ZXC_LZ_MAX_DIST))
+                break;
             const uint8_t* ref2 = src + next_idx;
 
             if ((!is_lazy_first || !skip_lazy_head) && zxc_le32(ref2) == next_val) {
@@ -540,8 +541,9 @@ _finalize_match:
 
             int is_first3 = 1;
             lazy_att = p.lazy_attempts;
-            while (idx3 > 0 && lazy_att-- > 0) {
-                if (UNLIKELY((uint32_t)(ip + 2 - src) - idx3 > ZXC_LZ_MAX_DIST)) break;
+            while (idx3 > 0) {
+                if (UNLIKELY(lazy_att-- <= 0 || (uint32_t)(ip + 2 - src) - idx3 > ZXC_LZ_MAX_DIST))
+                    break;
 
                 const uint8_t* ref3 = src + idx3;
                 if ((!is_first3 || !skip_head3) && zxc_le32(ref3) == val3) {
@@ -1213,8 +1215,10 @@ static int zxc_encode_block_glo(zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRIC
         zxc_lz_seed_dict(src, dict_sz, ctx->hash_table, ctx->hash_tags, ctx->chain_table,
                          epoch_mark, offset_mask, level);
 
-    const uint8_t *ip = src + dict_sz, *iend = src + src_sz, *anchor = ip,
-                  *search_limit = iend - ZXC_LZ_SEARCH_MARGIN;
+    const uint8_t* ip = src + dict_sz;
+    const uint8_t* iend = src + src_sz;
+    const uint8_t* anchor = ip;
+    const uint8_t* search_limit = iend - ZXC_LZ_SEARCH_MARGIN;
 
     uint32_t* const hash_table = ctx->hash_table;
     uint8_t* const hash_tags = ctx->hash_tags;
@@ -1260,7 +1264,7 @@ static int zxc_encode_block_glo(zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRIC
         if (m.ref) {
             ip -= m.backtrack;
             const uint32_t ll = (uint32_t)(ip - anchor);
-            const uint32_t ml = (uint32_t)(m.len - ZXC_LZ_MIN_MATCH_LEN);
+            const uint32_t ml = m.len - ZXC_LZ_MIN_MATCH_LEN;
             const uint32_t off = (uint32_t)(ip - m.ref);
 
             if (ll > 0) {
@@ -1609,7 +1613,10 @@ parse_done:;
                 size_t stop = start + Q;
                 if (start > lit_c) start = lit_c;
                 if (stop > lit_c) stop = lit_c;
-                uint64_t b0 = 0, b1 = 0, b2 = 0, b3 = 0;
+                uint64_t b0 = 0;
+                uint64_t b1 = 0;
+                uint64_t b2 = 0;
+                uint64_t b3 = 0;
                 size_t i = start;
 
                 for (; i + 4 <= stop; i += 4) {
@@ -1623,8 +1630,7 @@ parse_done:;
                 streams_bytes += (size_t)((bits + 7) / 8);
             }
             huf_total_size = ZXC_HUF_HEADER_SIZE + streams_bytes;
-            const size_t baseline =
-                (enc_lit == ZXC_SECTION_ENCODING_RLE) ? rle_size : (size_t)lit_c;
+            const size_t baseline = (enc_lit == ZXC_SECTION_ENCODING_RLE) ? rle_size : lit_c;
             /* Threshold: 3% savings (1/32) over the chosen RAW/RLE baseline.
              * Same heuristic as the RAW/RLE switch above. */
             if (huf_total_size < baseline - (baseline >> 5)) {
@@ -1667,8 +1673,7 @@ parse_done:;
                 if (huf_dict_total_size < huf_total_size)
                     enc_lit = ZXC_SECTION_ENCODING_HUFFMAN_DICT;
             } else {
-                const size_t baseline =
-                    (enc_lit == ZXC_SECTION_ENCODING_RLE) ? rle_size : (size_t)lit_c;
+                const size_t baseline = (enc_lit == ZXC_SECTION_ENCODING_RLE) ? rle_size : lit_c;
                 /* Same 3% (1/32) margin as the other encoding switches. */
                 if (huf_dict_total_size < baseline - (baseline >> 5))
                     enc_lit = ZXC_SECTION_ENCODING_HUFFMAN_DICT;
@@ -1696,7 +1701,7 @@ parse_done:;
                                     : (enc_lit == ZXC_SECTION_ENCODING_HUFFMAN) ? huf_total_size
                                     : (enc_lit == ZXC_SECTION_ENCODING_HUFFMAN_DICT)
                                         ? huf_dict_total_size
-                                        : (size_t)lit_c;
+                                        : lit_c;
     desc[0].sizes = (uint64_t)lit_section_size | ((uint64_t)lit_c << 32);
     desc[1].sizes = (uint64_t)seq_c | ((uint64_t)seq_c << 32);
     desc[2].sizes = (uint64_t)off_stream_size | ((uint64_t)off_stream_size << 32);
@@ -1717,14 +1722,13 @@ parse_done:;
     if (UNLIKELY(rem < sz_lit)) return ZXC_ERROR_DST_TOO_SMALL;
 
     if (enc_lit == ZXC_SECTION_ENCODING_HUFFMAN) {
-        const int written =
-            zxc_huf_encode_section(literals, (size_t)lit_c, huf_code_len, p_curr, rem);
+        const int written = zxc_huf_encode_section(literals, lit_c, huf_code_len, p_curr, rem);
         if (UNLIKELY(written < 0)) return written;
         if (UNLIKELY((size_t)written != huf_total_size)) return ZXC_ERROR_DST_TOO_SMALL;
         p_curr += written;
     } else if (enc_lit == ZXC_SECTION_ENCODING_HUFFMAN_DICT) {
         const int written =
-            zxc_huf_encode_section_dict(literals, (size_t)lit_c, dict_code_len, p_curr, rem);
+            zxc_huf_encode_section_dict(literals, lit_c, dict_code_len, p_curr, rem);
         if (UNLIKELY(written < 0)) return written;
         if (UNLIKELY((size_t)written != huf_dict_total_size)) return ZXC_ERROR_DST_TOO_SMALL;
         p_curr += written;
@@ -1892,8 +1896,10 @@ static int zxc_encode_block_ghi(zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRIC
         zxc_lz_seed_dict(src, dict_sz, ctx->hash_table, ctx->hash_tags, ctx->chain_table,
                          epoch_mark, offset_mask, level);
 
-    const uint8_t *ip = src + dict_sz, *iend = src + src_sz, *anchor = ip,
-                  *search_limit = iend - ZXC_LZ_SEARCH_MARGIN;
+    const uint8_t* ip = src + dict_sz;
+    const uint8_t* iend = src + src_sz;
+    const uint8_t* anchor = ip;
+    const uint8_t* search_limit = iend - ZXC_LZ_SEARCH_MARGIN;
 
     uint32_t* const hash_table = ctx->hash_table;
     uint8_t* const hash_tags = ctx->hash_tags;
@@ -1930,7 +1936,7 @@ static int zxc_encode_block_ghi(zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRIC
         if (m.ref) {
             ip -= m.backtrack;
             const uint32_t ll = (uint32_t)(ip - anchor);
-            const uint32_t ml = (uint32_t)(m.len - ZXC_LZ_MIN_MATCH_LEN);
+            const uint32_t ml = m.len - ZXC_LZ_MIN_MATCH_LEN;
             const uint32_t off = (uint32_t)(ip - m.ref);
 
             if (ll > 0) {
@@ -2044,17 +2050,15 @@ static int zxc_encode_block_ghi(zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRIC
  * @brief Encodes a raw data block (uncompressed).
  *
  * This function prepares and writes a "RAW" type block into the destination
- * buffer. It handles the block header, copying of source data, and optionally
- * the calculation and storage of a checksum.
+ * buffer. It handles the block header and copying of source data; any checksum
+ * is appended separately by the wrapper.
  *
  * @param[in] src Pointer to the source data to encode.
  * @param[in] src_sz Size of the source data in bytes.
  * @param[out] dst Pointer to the destination buffer.
  * @param[in] dst_cap Maximum capacity of the destination buffer.
  * @param[out] out_sz Pointer to a variable receiving the total written size
- * (header
- * + data + checksum).
- * @param[in] chk Boolean flag: if non-zero, a checksum is calculated and added.
+ * (header + data).
  *
  * @return ZXC_OK on success, or a negative zxc_error_t code (e.g., ZXC_ERROR_DST_TOO_SMALL) if the
  * destination buffer capacity is insufficient.

@@ -47,10 +47,13 @@
 /* The decoder lookup table entry type (zxc_huf_dec_entry_t) lives in
  * zxc_internal.h so the compression context can carry a prebuilt table for
  * the shared dictionary literal table. Bit layout recap:
- * sym1(0..7) | sym2(8..15) | len1(16..19) | len_total(20..23) | n_extra(24). */
+ * sym1(0..7) | sym2(8..15) | len1(16..19) | n_extra(24) | len_total(28..31).
+ * len_total sits in the top nibble so the hot loop extracts the per-symbol
+ * shift amount as `_e >> 28` with no mask, shaving one ALU uop off the
+ * load -> shift-amount -> accumulator-shift critical recurrence. */
 #define ZXC_HUF_ENTRY(sym1, sym2, len1, len_total, n_extra)                  \
     ((uint32_t)(sym1) | ((uint32_t)(sym2) << 8) | ((uint32_t)(len1) << 16) | \
-     ((uint32_t)(len_total) << 20) | ((uint32_t)(n_extra) << 24))
+     ((uint32_t)(n_extra) << 24) | ((uint32_t)(len_total) << 28))
 
 /* ===========================================================================
  * Length-limited Huffman: boundary package-merge
@@ -228,7 +231,9 @@ int zxc_huf_build_code_lengths(const uint32_t* RESTRICT freq, uint8_t* RESTRICT 
     for (int k = 1; k < ZXC_HUF_MAX_CODE_LEN; k++) {
         const int prev = counts[k - 1];
         const int packs = prev / 2;
-        int li = 0, pi = 0, n_lvl = 0;
+        int li = 0;
+        int pi = 0;
+        int n_lvl = 0;
         while (li < n || pi < packs) {
             const uint32_t wl = (li < n) ? leaves[li].w : UINT32_MAX;
             const uint32_t wp =
@@ -399,8 +404,7 @@ static int unpack_lengths_header(const uint8_t* RESTRICT in, uint8_t* RESTRICT c
         if (lo) n_present++;
         if (hi) n_present++;
     }
-    if (UNLIKELY(max_len > ZXC_HUF_MAX_CODE_LEN)) return ZXC_ERROR_CORRUPT_DATA;
-    if (UNLIKELY(n_present == 0)) return ZXC_ERROR_CORRUPT_DATA;
+    if (UNLIKELY(max_len > ZXC_HUF_MAX_CODE_LEN || n_present == 0)) return ZXC_ERROR_CORRUPT_DATA;
     return ZXC_OK;
 }
 
@@ -527,7 +531,7 @@ static int zxc_huf_encode_streams(const uint8_t* RESTRICT literals, const size_t
         size_t stop = start + Q;
         if (stop > n_literals) stop = n_literals;
 
-        uint8_t* const stream_start = p;
+        const uint8_t* const stream_start = p;
         bw_init(&bw, p, (size_t)(stream_end - p));
         for (size_t i = start; i < stop; i++) {
             const uint8_t sym = literals[i];
@@ -797,9 +801,18 @@ static int zxc_huf_decode_streams(const uint8_t* RESTRICT payload, const size_t 
 
     /* Hoist all four bit-reader hot fields into locals. They live in
      * registers for the full duration of the batched loop. */
-    uint64_t a0 = br[0].accum, a1 = br[1].accum, a2 = br[2].accum, a3 = br[3].accum;
-    int bb0 = br[0].bits, bb1 = br[1].bits, bb2 = br[2].bits, bb3 = br[3].bits;
-    const uint8_t *p0 = br[0].ptr, *p1 = br[1].ptr, *p2 = br[2].ptr, *p3 = br[3].ptr;
+    uint64_t a0 = br[0].accum;
+    uint64_t a1 = br[1].accum;
+    uint64_t a2 = br[2].accum;
+    uint64_t a3 = br[3].accum;
+    int bb0 = br[0].bits;
+    int bb1 = br[1].bits;
+    int bb2 = br[2].bits;
+    int bb3 = br[3].bits;
+    const uint8_t* p0 = br[0].ptr;
+    const uint8_t* p1 = br[1].ptr;
+    const uint8_t* p2 = br[2].ptr;
+    const uint8_t* p3 = br[3].ptr;
     const uint8_t* const e0 = br[0].end;
     const uint8_t* const e1 = br[1].end;
     const uint8_t* const e2 = br[2].end;
@@ -837,10 +850,10 @@ static int zxc_huf_decode_streams(const uint8_t* RESTRICT payload, const size_t 
         zxc_store_le16(d1, (uint16_t)_e1);                       \
         zxc_store_le16(d2, (uint16_t)_e2);                       \
         zxc_store_le16(d3, (uint16_t)_e3);                       \
-        const int _t0 = (int)((_e0 >> 20) & 0xF);                \
-        const int _t1 = (int)((_e1 >> 20) & 0xF);                \
-        const int _t2 = (int)((_e2 >> 20) & 0xF);                \
-        const int _t3 = (int)((_e3 >> 20) & 0xF);                \
+        const int _t0 = (int)(_e0 >> 28);                        \
+        const int _t1 = (int)(_e1 >> 28);                        \
+        const int _t2 = (int)(_e2 >> 28);                        \
+        const int _t3 = (int)(_e3 >> 28);                        \
         d0 += 1 + (int)((_e0 >> 24) & 1);                        \
         d1 += 1 + (int)((_e1 >> 24) & 1);                        \
         d2 += 1 + (int)((_e2 >> 24) & 1);                        \
@@ -864,7 +877,10 @@ static int zxc_huf_decode_streams(const uint8_t* RESTRICT payload, const size_t 
         REFILL(a2, bb2, p2, e2);
         REFILL(a3, bb3, p3, e3);
 
-        int sl0 = 0, sl1 = 0, sl2 = 0, sl3 = 0;
+        int sl0 = 0;
+        int sl1 = 0;
+        int sl2 = 0;
+        int sl3 = 0;
         DECODE_ONE();
         DECODE_ONE();
         DECODE_ONE();

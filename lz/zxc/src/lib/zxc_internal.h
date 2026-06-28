@@ -473,10 +473,10 @@ extern "C" {
  *  @brief Hash table geometry, sliding window, and match parameters.
  *
  *  The hash table uses a split layout with 15-bit addressing (32 768 buckets):
- *  - `hash_positions[]`: uint32_t, stores `(epoch << offset_bits) | position` (128 KB).
+ *  - `hash_table[]`: uint32_t, stores `(epoch << offset_bits) | position` (128 KB).
  *  - `hash_tags[]`:      uint8_t, stores an 8-bit tag for fast rejection (32 KB).
  *  Total: 160 KB.  The tag table fits in L1 cache, enabling a
- *  "filter-first" access pattern that avoids cold loads into hash_positions
+ *  "filter-first" access pattern that avoids cold loads into hash_table
  *  on the ~60-75% of lookups where the tag mismatches.
  *  The 64 KB sliding window allows `chain_table` to use `uint16_t`.
  *  @{ */
@@ -620,8 +620,12 @@ extern "C" {
  *   bits  0..7   sym1       - first decoded symbol
  *   bits  8..15  sym2       - second decoded symbol (junk if n_extra == 0)
  *   bits 16..19  len1       - bit length of sym1's code (1..8)
- *   bits 20..23  len_total  - total bits consumed (1..11)
  *   bit  24      n_extra    - 0 if 1 symbol, 1 if 2 symbols decoded
+ *   bits 28..31  len_total  - total bits consumed (1..11)
+ *
+ * len_total occupies the top nibble so the hot decode loop reads the
+ * per-symbol shift amount as `entry >> 28` (no mask), trimming one ALU uop
+ * from the load -> shift-amount -> accumulator-shift critical recurrence.
  *
  * Lives here (not in zxc_huffman.c) so a prebuilt table can be carried by the
  * compression context for the shared dictionary literal table.
@@ -815,7 +819,7 @@ typedef enum {
  * - `ZXC_SECTION_ENCODING_RAW`: Data is stored uncompressed.
  * - `ZXC_SECTION_ENCODING_RLE`: Run-Length Encoding.
  * - `ZXC_SECTION_ENCODING_HUFFMAN`: Canonical Huffman, 4-way interleaved
- *   sub-streams, max 11-bit codes, LSB-first. Only valid for the literal
+ *   sub-streams, max 8-bit codes, LSB-first. Only valid for the literal
  *   stream (`enc_lit`) of GLO blocks. Produced exclusively at level >= 6.
  * - `ZXC_SECTION_ENCODING_HUFFMAN_DICT`: same bitstream layout as HUFFMAN but
  *   the 128-byte code-lengths header is omitted: codes come from the shared
@@ -1508,7 +1512,7 @@ int zxc_huf_unpack_lengths(const uint8_t* RESTRICT in, uint8_t* RESTRICT code_le
  * - @c chain_table: collision chain storing the *previous* occurrence of a
  *   hash, forming a linked list per bucket and enabling history traversal.
  * - @c epoch: drives "lazy hash table invalidation". Instead of memset-ing
- *   the hash table for every block, we store `(epoch << 16) | offset`; an
+ *   the hash table for every block, we store `(epoch << offset_bits) | offset`; an
  *   entry whose stored epoch differs from `ctx->epoch` is treated as empty.
  */
 typedef struct {
