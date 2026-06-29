@@ -47,10 +47,7 @@
 /* The decoder lookup table entry type (zxc_huf_dec_entry_t) lives in
  * zxc_internal.h so the compression context can carry a prebuilt table for
  * the shared dictionary literal table. Bit layout recap:
- * sym1(0..7) | sym2(8..15) | len1(16..19) | n_extra(24) | len_total(28..31).
- * len_total sits in the top nibble so the hot loop extracts the per-symbol
- * shift amount as `_e >> 28` with no mask, shaving one ALU uop off the
- * load -> shift-amount -> accumulator-shift critical recurrence. */
+ * sym1(0..7) | sym2(8..15) | len1(16..19) | n_extra(24) | len_total(28..31). */
 #define ZXC_HUF_ENTRY(sym1, sym2, len1, len_total, n_extra)                  \
     ((uint32_t)(sym1) | ((uint32_t)(sym2) << 8) | ((uint32_t)(len1) << 16) | \
      ((uint32_t)(n_extra) << 24) | ((uint32_t)(len_total) << 28))
