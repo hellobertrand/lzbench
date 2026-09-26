@@ -25,9 +25,9 @@
 /** @brief Major version number. */
 #define ZXC_VERSION_MAJOR 0
 /** @brief Minor version number. */
-#define ZXC_VERSION_MINOR 14
+#define ZXC_VERSION_MINOR 15
 /** @brief Patch version number. */
-#define ZXC_VERSION_PATCH 1
+#define ZXC_VERSION_PATCH 0
 
 /** @cond INTERNAL */
 #define ZXC_STR_HELPER(x) #x
@@ -35,7 +35,7 @@
 /** @endcond */
 
 /**
- * @brief Human-readable version string in "MAJOR.MINOR.PATCH" form (e.g. "0.14.1").
+ * @brief Human-readable version string in "MAJOR.MINOR.PATCH" form (e.g. "0.15.0").
  */
 #define ZXC_LIB_VERSION_STR    \
     ZXC_STR(ZXC_VERSION_MAJOR) \
@@ -102,8 +102,10 @@
 /** @brief File header size: Magic(4) + Version(1) + Chunk(1) + Flags(1) + Reserved(7) +
  * Checksum(2). */
 #define ZXC_FILE_HEADER_SIZE 16
-/** @brief File footer size: original_size(8) + global_checksum(4). */
-#define ZXC_FILE_FOOTER_SIZE 12
+/** @brief File footer base: original_size(8), the footer's first 8 bytes. */
+#define ZXC_FILE_FOOTER_SIZE 8
+/** @brief Archive digest, the footer's last 8 bytes when the header sets HAS_CHECKSUM. */
+#define ZXC_FILE_DIGEST_SIZE 8
 /** @} */ /* end of file_format */
 
 /**
