@@ -174,7 +174,9 @@ ZXC_EXPORT size_t zxc_decompress_inplace_bound(const void* src, const size_t src
  * The archive must sit **flush-right** in @p buffer (its last @p comp_size
  * bytes). Decoding runs left-to-right from @c buffer[0]; as long as
  * @p buffer_capacity is at least @ref zxc_decompress_inplace_bound, the write
- * cursor provably never overtakes the read cursor. One allocation instead of
+ * cursor provably never overtakes the read cursor; an archive whose output would
+ * reach unread input (padding, forged block sizes) is refused with
+ * @ref ZXC_ERROR_CORRUPT_DATA first. One allocation instead of
  * two, which is what makes this worthwhile on memory-constrained targets
  * (embedded, FOTA, firmware).
  *
@@ -289,7 +291,8 @@ ZXC_EXPORT uint64_t zxc_decompress_block_bound(const size_t uncompressed_size);
  * @brief Compresses a single block without file framing.
  *
  * Output is @c block_header(8B) + payload + optional @c checksum(4B), readable
- * by zxc_decompress_block(). One format-conformant block per call: @p src_size
+ * by zxc_decompress_block(). The checksum covers the uncompressed bytes, seeded
+ * with position 0. One format-conformant block per call: @p src_size
  * must not exceed @ref ZXC_BLOCK_SIZE_MAX (2 MiB). For larger payloads use the
  * frame API (zxc_compress) or the streaming API (zxc_cstream_*), which chunk
  * transparently.
@@ -339,6 +342,8 @@ ZXC_EXPORT int64_t zxc_compress_block(zxc_cctx* cctx, const void* src, size_t sr
  *                             used; a block carries no dictionary id, so pass
  *                             the same (content, table) pair as at compression.
  *                             Static context: @ref ZXC_ERROR_DICT_UNSUPPORTED.
+ *                             The checksum is checked after decoding, at
+ *                             position 0: a frame's later blocks fail it.
  *
  * @note @p src and @p dst must not overlap (same contract as memcpy).
  *
@@ -347,8 +352,8 @@ ZXC_EXPORT int64_t zxc_compress_block(zxc_cctx* cctx, const void* src, size_t sr
  *         per-block limit. Static context: the carved block is the effective
  *         capacity; a larger block is @ref ZXC_ERROR_BAD_BLOCK_SIZE while it
  *         fits the workspace margin and fails like a too-small destination
- *         beyond it. On error @p dst holds whatever the aborted decode wrote;
- *         its previous contents do not survive.
+ *         beyond it. On error @p dst holds whatever the decode wrote, all of it
+ *         on @ref ZXC_ERROR_BAD_CHECKSUM; its previous contents do not survive.
  */
 ZXC_EXPORT int64_t zxc_decompress_block(zxc_dctx* dctx, const void* src, size_t src_size, void* dst,
                                         size_t dst_capacity, const zxc_decompress_opts_t* opts);
@@ -385,7 +390,8 @@ ZXC_EXPORT int64_t zxc_decompress_block(zxc_dctx* dctx, const void* src, size_t 
  *         @ref ZXC_ERROR_BAD_BLOCK_SIZE if @p dst_capacity >
  *         @ref ZXC_BLOCK_SIZE_MAX. Static context: same bound and codes as
  *         zxc_decompress_block(), a larger @p dst_capacity accepted alike. On
- *         error @p dst holds whatever the aborted decode wrote.
+ *         error @p dst holds whatever the decode wrote, all of it on
+ *         @ref ZXC_ERROR_BAD_CHECKSUM.
  */
 ZXC_EXPORT int64_t zxc_decompress_block_safe(zxc_dctx* dctx, const void* src, const size_t src_size,
                                              void* dst, const size_t dst_capacity,
@@ -396,10 +402,9 @@ ZXC_EXPORT int64_t zxc_decompress_block_safe(zxc_dctx* dctx, const void* src, co
  *
  * Totals everything @ref zxc_compress_block reserves for a @p src_size block:
  * per-chunk working buffers (chain table, literals, sequence/token/offset/extras),
- * the fixed hash tables, and cache-line padding. At @p level >= 6 it also counts
- * the `opt_scratch` region (~8.125 x @p src_size) used by the price-based optimal
- * parser, which is lazy-allocated on the first level-6 call and then reused for
- * the lifetime of the cctx. Scales roughly linearly with @p src_size.
+ * the fixed hash tables and match-split histograms, and cache-line padding. At
+ * @p level >= 6 it also counts the `opt_scratch` region: ~8.125 x @p src_size for
+ * the optimal parser. Lazy-allocated on the first level-6 call, then kept for the cctx's lifetime.
  *
  * @param[in] src_size Uncompressed block size in bytes.
  * @param[in] level    Compression level (1..7). Levels <= 5 share the same
