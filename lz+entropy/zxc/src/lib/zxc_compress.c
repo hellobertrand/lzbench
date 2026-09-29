@@ -458,6 +458,89 @@ typedef struct {
 } zxc_match_t;
 
 /**
+ * @brief Tells whether a match reaches a given length, without measuring it.
+ *
+ * The lazy evaluation only needs a yes or no, so the compare stops at @p need
+ * or at the first difference. Bytes below @p from are taken as already equal.
+ *
+ * @param[in] cur  Position being matched.
+ * @param[in] ref  Candidate, earlier in the same buffer.
+ * @param[in] from Bytes already known to match.
+ * @param[in] need Length to reach; at most @p iend - @p cur.
+ * @param[in] iend End of the input buffer.
+ * @return 1 if cur[from, need) equals ref[from, need), else 0.
+ */
+static ZXC_ALWAYS_INLINE int zxc_match_reaches(const uint8_t* cur, const uint8_t* ref,
+                                               uint32_t from, const uint32_t need,
+                                               const uint8_t* iend) {
+    while (from < need) {
+        if (UNLIKELY((size_t)(iend - cur) - from < sizeof(uint64_t))) {
+            while (from < need && cur[from] == ref[from]) from++;
+            return from >= need;
+        }
+        const uint64_t d = zxc_le64(cur + from) ^ zxc_le64(ref + from);
+        if (d != 0) return from + (uint32_t)(zxc_ctz64(d) >> 3) >= need;
+        from += sizeof(uint64_t);
+    }
+    return 1;
+}
+
+/**
+ * @brief Lazy probe: tells whether @p lp holds a match of at least @p need bytes.
+ *
+ * Read-only walk of the chain at @p lp. Candidates are gated on the last 4 of
+ * the @p need bytes, [need-4, need), and the first to reach @p need settles it.
+ *
+ * @param[in] src         Start of the source buffer.
+ * @param[in] lp          Position probed; at least 8 bytes must be readable.
+ * @param[in] iend        End of the input buffer.
+ * @param[in] need        Length a candidate must reach.
+ * @param[in] hash_table  Position table.
+ * @param[in] hash_tags   Tag table.
+ * @param[in] chain_table Chain table.
+ * @param[in] epoch_mark  Current epoch marker.
+ * @param[in] offset_mask Mask isolating the position bits.
+ * @param[in] use_hash5   Non-zero for the 5-byte hash.
+ * @param[in] p           LZ77 parameters (lazy_attempts, min_offset).
+ * @return 1 if such a match exists within the search budget, else 0.
+ */
+static ZXC_ALWAYS_INLINE int zxc_lazy_probe(const uint8_t* src, const uint8_t* lp,
+                                            const uint8_t* iend, const uint32_t need,
+                                            const uint32_t* RESTRICT hash_table,
+                                            const uint8_t* RESTRICT hash_tags,
+                                            const uint16_t* RESTRICT chain_table,
+                                            const uint32_t epoch_mark, const uint32_t offset_mask,
+                                            const int use_hash5, const zxc_lz77_params_t p) {
+    if (need > (size_t)(iend - lp)) return 0;  // too close to the end to win
+
+    const uint64_t val8 = zxc_le64(lp);
+    const uint32_t val = (uint32_t)val8;
+    const uint32_t h = zxc_hash_func(val8, use_hash5);
+    const uint32_t pos = (uint32_t)(lp - src);
+    const uint32_t gate = zxc_le32(lp + need - 4);
+    uint32_t idx = zxc_epoch_pos(hash_table[h], offset_mask, epoch_mark);
+    // A head with another tag is another string: walk past it.
+    int skip = (hash_tags[h] != zxc_hash_tag(val));
+
+    for (int att = p.lazy_attempts; idx > 0 && att > 0; att--) {
+        if (UNLIKELY(pos - idx > ZXC_LZ_MAX_DIST)) break;
+        const uint8_t* const ref = src + idx;
+
+        // Filtered here too: a lazy hit only cancels best.ref, so a match
+        // we could never emit would drop a legal one for nothing.
+        if (pos - idx >= p.min_offset && !skip && zxc_le32(ref + need - 4) == gate &&
+            zxc_le32(ref) == val && zxc_match_reaches(lp, ref, sizeof(uint32_t), need, iend))
+            return 1;
+
+        const uint16_t delta = chain_table[idx & ZXC_LZ_WINDOW_MASK];
+        if (UNLIKELY(delta == 0)) break;
+        idx -= delta;
+        skip = 0;
+    }
+    return 0;
+}
+
+/**
  * @brief Finds the best matching sequence for LZ77 compression
  *
  * Uses a split hash table layout:
@@ -569,14 +652,13 @@ static ZXC_ALWAYS_INLINE zxc_match_t zxc_lz77_find_best_match(
         // resolves while we prefetch.
         const uint16_t delta = chain_table[match_idx & ZXC_LZ_WINDOW_MASK];
         const uint32_t next_idx = match_idx - delta;
-        ZXC_PREFETCH_READ(src + next_idx);
+        ZXC_PREFETCH_READ(src + next_idx + best.len - 3);
 
-        const uint32_t ref_val = zxc_le32(ref);
-        const int tag_match = (ref_val == cur_val);
-        // Cheap gate: 4-byte tag match, then check the byte past the current
-        // best (the && skips that load unless the tag already matched).
-        const int should_compare =
-            (cur_pos - match_idx) >= p.min_offset && tag_match && (ref[best.len] == ip[best.len]);
+        // Gate first: most candidates share the head and fail on bytes
+        // [best.len-3, best.len], which a longer match must also cover.
+        const int should_compare = (cur_pos - match_idx) >= p.min_offset &&
+                                   zxc_le32(ref + best.len - 3) == zxc_le32(ip + best.len - 3) &&
+                                   zxc_le32(ref) == cur_val;
 
         if (should_compare) {
             uint32_t mlen = sizeof(uint32_t);  // We already know the first 4 bytes match
@@ -748,103 +830,34 @@ _finalize_match:
         best.ref = b_ref;
     }
 
+    // Lazy: a longer match one byte ahead (two from level 4) cancels this one.
     if (p.use_lazy && best.ref && best.len < (uint32_t)p.lazy_len_threshold &&
         ip + 1 < search_limit) {
-        // --- Lazy evaluation at ip+1 ---
-        const uint64_t next_val8 = zxc_le64(ip + 1);
-        const uint32_t next_val = (uint32_t)next_val8;
-        const uint32_t h2 = zxc_hash_func(next_val8, use_hash5);
-        const uint8_t next_stored_tag = hash_tags[h2];
-        const uint32_t next_head = hash_table[h2];
-        uint32_t next_idx = zxc_epoch_pos(next_head, offset_mask, epoch_mark);
-        const uint8_t next_tag = zxc_hash_tag(next_val);
-        const int skip_lazy_head = (next_idx > 0 && next_stored_tag != next_tag);
-        uint32_t max_lazy2 = 0;
-        int lazy_att = p.lazy_attempts;
-        int is_lazy_first = 1;
-
-        while (next_idx > 0) {
-            if (UNLIKELY(lazy_att-- <= 0 || (uint32_t)(ip + 1 - src) - next_idx > ZXC_LZ_MAX_DIST))
-                break;
-            const uint8_t* ref2 = src + next_idx;
-
-            // Filtered here too: a lazy hit only cancels best.ref, so a match
-            // we could never emit would drop a legal one for nothing.
-            if (((uint32_t)(ip + 1 - src) - next_idx) >= p.min_offset &&
-                (!is_lazy_first || !skip_lazy_head) && zxc_le32(ref2) == next_val) {
-                uint32_t l2 = sizeof(uint32_t);
-                const uint8_t* limit = iend - sizeof(uint64_t);
-
-                while (ip + 1 + l2 < limit) {
-                    const uint64_t v1 = zxc_le64(ip + 1 + l2);
-                    const uint64_t v2 = zxc_le64(ref2 + l2);
-                    if (v1 != v2) {
-                        l2 += (uint32_t)(zxc_ctz64(v1 ^ v2) >> 3);
-                        goto lazy2_done;
-                    }
-                    l2 += sizeof(uint64_t);
-                }
-                while (ip + 1 + l2 < iend && ref2[l2] == ip[1 + l2]) l2++;
-            lazy2_done:
-                max_lazy2 = l2 > max_lazy2 ? l2 : max_lazy2;
-            }
-
-            const uint16_t delta = chain_table[next_idx & ZXC_LZ_WINDOW_MASK];
-            if (UNLIKELY(delta == 0)) break;
-            next_idx -= delta;
-            is_lazy_first = 0;
-        }
-
-        // --- Lazy evaluation at ip+2 (computed in parallel, no dependency on lazy 1) ---
-        uint32_t max_lazy3 = 0;
-        if (level >= ZXC_LEVEL_BALANCED && ip + 2 < search_limit) {
-            const uint64_t val3_8 = zxc_le64(ip + 2);
-            const uint32_t val3 = (uint32_t)val3_8;
-            const uint32_t h3 = zxc_hash_func(val3_8, use_hash5);
-            const uint8_t tag3 = hash_tags[h3];
-            const uint32_t head3 = hash_table[h3];
-            uint32_t idx3 = zxc_epoch_pos(head3, offset_mask, epoch_mark);
-            const uint8_t cur_tag3 = zxc_hash_tag(val3);
-            const int skip_head3 = (idx3 > 0 && tag3 != cur_tag3);
-
-            int is_first3 = 1;
-            lazy_att = p.lazy_attempts;
-            while (idx3 > 0) {
-                if (UNLIKELY(lazy_att-- <= 0 || (uint32_t)(ip + 2 - src) - idx3 > ZXC_LZ_MAX_DIST))
-                    break;
-
-                const uint8_t* ref3 = src + idx3;
-                if (((uint32_t)(ip + 2 - src) - idx3) >= p.min_offset &&
-                    (!is_first3 || !skip_head3) && zxc_le32(ref3) == val3) {
-                    uint32_t l3 = sizeof(uint32_t);
-                    const uint8_t* limit = iend - sizeof(uint64_t);
-
-                    while (ip + 2 + l3 < limit) {
-                        const uint64_t v1 = zxc_le64(ip + 2 + l3);
-                        const uint64_t v2 = zxc_le64(ref3 + l3);
-                        if (v1 != v2) {
-                            l3 += (uint32_t)(zxc_ctz64(v1 ^ v2) >> 3);
-                            goto lazy3_done;
-                        }
-                        l3 += sizeof(uint64_t);
-                    }
-                    while (ip + 2 + l3 < iend && ref3[l3] == ip[2 + l3]) l3++;
-                lazy3_done:
-                    max_lazy3 = l3 > max_lazy3 ? l3 : max_lazy3;
-                }
-
-                const uint16_t delta = chain_table[idx3 & ZXC_LZ_WINDOW_MASK];
-                if (UNLIKELY(delta == 0)) break;
-                idx3 -= delta;
-                is_first3 = 0;
-            }
-        }
-
-        // Single decision: invalidate if either lazy position found a better match
-        if (max_lazy2 > best.len + 1 || max_lazy3 > best.len + 2) best.ref = NULL;
+        if (zxc_lazy_probe(src, ip + 1, iend, best.len + 2, hash_table, hash_tags, chain_table,
+                           epoch_mark, offset_mask, use_hash5, p) ||
+            (level >= ZXC_LEVEL_BALANCED && ip + 2 < search_limit &&
+             zxc_lazy_probe(src, ip + 2, iend, best.len + 3, hash_table, hash_tags, chain_table,
+                            epoch_mark, offset_mask, use_hash5, p)))
+            best.ref = NULL;
     }
 
     return best;
+}
+
+/**
+ * @brief Relaxes dp[p + L] with a match of length @p L costing @p nxt in total.
+ *
+ * Strict comparison: on a tie the earlier transition keeps the cell.
+ */
+static ZXC_ALWAYS_INLINE void zxc_opt_relax(uint32_t* RESTRICT dp, uint16_t* RESTRICT parent_len,
+                                            uint16_t* RESTRICT parent_off, const size_t p,
+                                            const size_t L, const uint32_t nxt,
+                                            const uint16_t off_biased) {
+    if (nxt < dp[p + L]) {
+        dp[p + L] = nxt;
+        parent_len[p + L] = (uint16_t)L;
+        parent_off[p + L] = off_biased;
+    }
 }
 
 /**
@@ -988,13 +1001,7 @@ static ZXC_ALWAYS_INLINE size_t zxc_opt_dp_update_const_cost(
 #endif
     // Scalar tail (and full path on archs without SIMD).
     // L < L_end <= UINT16_MAX (caller precondition), so the cast is lossless.
-    for (; L < L_end; L++) {
-        if (nxt < dp[p + L]) {
-            dp[p + L] = nxt;
-            parent_len[p + L] = (uint16_t)L;
-            parent_off[p + L] = off_biased;
-        }
-    }
+    for (; L < L_end; L++) zxc_opt_relax(dp, parent_len, parent_off, p, L, nxt, off_biased);
     return L;
 }
 
@@ -1067,9 +1074,10 @@ static uint32_t zxc_opt_estimate_lit_bits(const uint8_t* RESTRICT src, const siz
  * to be skipped at positions strictly inside a long match, without this
  * guard, highly repetitive data (e.g. Lorem-loop with multi-MB matches at
  * every offset) makes the parser quadratic and unit tests run for minutes.
- * The inner sub-length update loop visits every L from `MIN_MATCH` to
- * `max_L`; the skip threshold means each long-match region only pays its
- * O(L) cost once at the starting position, keeping total work O(N).
+ * The inner sub-length update visits every L from `MIN_MATCH` to `max_L`,
+ * except at a covered position (see the loop), which relaxes at most two
+ * cells; the skip threshold means each long-match region only pays its O(L)
+ * cost once at the starting position, keeping total work O(N).
  *
  * @param[in,out] ctx           Compression context. The lazy-allocated
  *                              `opt_scratch` field provides the DP arrays;
@@ -1166,6 +1174,9 @@ static int zxc_lz77_optimal_parse_glo(zxc_cctx_t* RESTRICT ctx, const uint8_t* R
     size_t skip_until = 0;
     // Rolling repeat-offset seed for find_best_match
     uint32_t last_off = 0;
+    // Previous matched position and the length relaxed from it.
+    size_t prev_p = 0;
+    size_t prev_len = 0;
     for (size_t p = 0; p < search_limit_pos; p++) {
         if (UNLIKELY(dp[p] == UINT32_MAX)) continue;
 
@@ -1203,42 +1214,52 @@ static int zxc_lz77_optimal_parse_glo(zxc_cctx_t* RESTRICT ctx, const uint8_t* R
                 // rare enough to stay scalar.
                 const uint16_t off_biased = (uint16_t)(off - ZXC_LZ_OFFSET_BIAS);
                 const size_t L_max_plus = L_max + 1;
-                size_t L = ZXC_LZ_MIN_MATCH_LEN;
+                const size_t L_cheap_end = ZXC_LZ_MIN_MATCH_LEN + ZXC_TOKEN_ML_MASK;
+                const size_t L_v1_end = L_cheap_end + 128;
+                const uint32_t nxt_cheap = dp[p] + ZXC_OPT_MATCH_COST_BASE;
+                const uint32_t nxt_v1 = nxt_cheap + CHAR_BIT;
 
-                // 1. Cheap range.
-                {
-                    const size_t L_cheap_end = ZXC_LZ_MIN_MATCH_LEN + ZXC_TOKEN_ML_MASK;
-                    const size_t L_end = (L_max_plus < L_cheap_end) ? L_max_plus : L_cheap_end;
-                    const uint32_t nxt = dp[p] + ZXC_OPT_MATCH_COST_BASE;
-                    L = zxc_opt_dp_update_const_cost(dp, parent_len, parent_off, p, L, L_end, nxt,
-                                                     off_biased);
-                }
+                // Covered: each processed position q bounds dp[q+l] by
+                // dp[q] + cost(l), by relaxing or through its own predecessor.
+                // With dp[p] >= dp[p-1], length l only wins where cost(l) <
+                // cost(l+1): the last length of the two classes below
+                // ZXC_OPT_LONG_MATCH_SKIP. Costs ignore the offset.
+                const int covered = prev_len > L_max && prev_p + 1 == p && dp[p] >= dp[p - 1];
+                prev_p = p;
+                prev_len = L_max;
 
-                // 2. First varint level (1-byte extension).
-                if (L < L_max_plus) {
-                    const size_t L_v1_end = ZXC_LZ_MIN_MATCH_LEN + ZXC_TOKEN_ML_MASK + 128;
-                    const size_t L_end = (L_max_plus < L_v1_end) ? L_max_plus : L_v1_end;
-                    const uint32_t nxt = dp[p] + ZXC_OPT_MATCH_COST_BASE + CHAR_BIT;
-                    L = zxc_opt_dp_update_const_cost(dp, parent_len, parent_off, p, L, L_end, nxt,
-                                                     off_biased);
-                }
+                if (covered) {
+                    if (L_max_plus >= L_cheap_end)
+                        zxc_opt_relax(dp, parent_len, parent_off, p, L_cheap_end - 1, nxt_cheap,
+                                      off_biased);
+                    if (L_max_plus >= L_v1_end)
+                        zxc_opt_relax(dp, parent_len, parent_off, p, L_v1_end - 1, nxt_v1,
+                                      off_biased);
+                } else {
+                    // 1. Cheap range.
+                    size_t L = zxc_opt_dp_update_const_cost(
+                        dp, parent_len, parent_off, p, ZXC_LZ_MIN_MATCH_LEN,
+                        (L_max_plus < L_cheap_end) ? L_max_plus : L_cheap_end, nxt_cheap,
+                        off_biased);
 
-                // 3. Higher varint levels: variable cost, kept scalar.
-                // Reached only by L >= ML_MASK + 128 + MIN_MATCH, so the
-                // v >= ML_MASK guard from the original loop is implied.
-                for (; L < L_max_plus; L++) {
-                    uint32_t cost = ZXC_OPT_MATCH_COST_BASE;
-                    uint32_t v = (uint32_t)(L - ZXC_LZ_MIN_MATCH_LEN) - ZXC_TOKEN_ML_MASK;
-                    cost += CHAR_BIT;
-                    while (v >= 128) {
-                        v >>= 7;
+                    // 2. First varint level (1-byte extension).
+                    if (L < L_max_plus)
+                        L = zxc_opt_dp_update_const_cost(
+                            dp, parent_len, parent_off, p, L,
+                            (L_max_plus < L_v1_end) ? L_max_plus : L_v1_end, nxt_v1, off_biased);
+
+                    // 3. Higher varint levels: variable cost, kept scalar.
+                    // Reached only by L >= ML_MASK + 128 + MIN_MATCH, so the
+                    // v >= ML_MASK guard from the original loop is implied.
+                    for (; L < L_max_plus; L++) {
+                        uint32_t cost = ZXC_OPT_MATCH_COST_BASE;
+                        uint32_t v = (uint32_t)(L - ZXC_LZ_MIN_MATCH_LEN) - ZXC_TOKEN_ML_MASK;
                         cost += CHAR_BIT;
-                    }
-                    const uint32_t nxt = dp[p] + cost;
-                    if (nxt < dp[p + L]) {
-                        dp[p + L] = nxt;
-                        parent_len[p + L] = (uint16_t)L;
-                        parent_off[p + L] = off_biased;
+                        while (v >= 128) {
+                            v >>= 7;
+                            cost += CHAR_BIT;
+                        }
+                        zxc_opt_relax(dp, parent_len, parent_off, p, L, dp[p] + cost, off_biased);
                     }
                 }
                 if (UNLIKELY(L_max >= ZXC_OPT_LONG_MATCH_SKIP)) skip_until = p + L_max - 1;
