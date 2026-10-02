@@ -1,8 +1,8 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
 /*
  * ZXC - High-performance lossless compression
  *
- * Copyright (c) 2025-2026 Bertrand Lebonnois and contributors.
- * SPDX-License-Identifier: BSD-3-Clause
+ * Copyright (c) Bertrand Lebonnois and contributors.
  */
 
 /**
@@ -684,7 +684,7 @@ ZXC_EXPORT size_t zxc_static_dctx_workspace_size(const size_t block_size);
  * zxc_decompress_block() for the codes).
  *
  * @par No dictionary
- * Any dictionary is rejected with @ref ZXC_ERROR_DICT_UNSUPPORTED: the
+ * Any dictionary is rejected with @ref ZXC_ERROR_DICT_UNSUPPORTED, since the
  * workspace has no room for the prefix.
  *
  * @param[in,out] workspace       Caller-allocated buffer, cache-line aligned.

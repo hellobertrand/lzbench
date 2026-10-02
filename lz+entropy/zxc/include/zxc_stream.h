@@ -1,8 +1,8 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
 /*
  * ZXC - High-performance lossless compression
  *
- * Copyright (c) 2025-2026 Bertrand Lebonnois and contributors.
- * SPDX-License-Identifier: BSD-3-Clause
+ * Copyright (c) Bertrand Lebonnois and contributors.
  */
 
 /**
@@ -101,7 +101,7 @@ ZXC_EXPORT int64_t zxc_stream_decompress(FILE* f_in, FILE* f_out,
  *
  * @param[in] f_in  Input stream, opened in "rb" mode.
  *
- * @return Original uncompressed size in bytes, or a negative @ref zxc_error_t:
+ * @return Original uncompressed size in bytes, or a negative @ref zxc_error_t code:
  *         the header's verdict (e.g. @ref ZXC_ERROR_BAD_MAGIC,
  *         @ref ZXC_ERROR_BAD_HEADER), @ref ZXC_ERROR_SRC_TOO_SMALL,
  *         @ref ZXC_ERROR_CORRUPT_DATA for an implausible size, or an I/O error.
