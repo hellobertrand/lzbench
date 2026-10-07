@@ -320,6 +320,17 @@ extern "C" {
 
 /** @brief Magic word identifying ZXC files (little-endian 0x9CB02EF5). */
 #define ZXC_MAGIC_WORD 0x9CB02EF5U
+
+/** @brief Whether the first @p n bytes (up to 4) at @p p agree with the magic word, so
+ *  a frame may start there: the check a reader makes as bytes arrive. */
+static inline int zxc_magic_prefix_ok(const uint8_t* p, const size_t n) {
+    static const uint8_t magic[4] = {(uint8_t)ZXC_MAGIC_WORD, (uint8_t)(ZXC_MAGIC_WORD >> 8),
+                                     (uint8_t)(ZXC_MAGIC_WORD >> 16),
+                                     (uint8_t)(ZXC_MAGIC_WORD >> 24)};
+    for (size_t i = 0; i < n && i < sizeof(magic); i++)
+        if (p[i] != magic[i]) return 0;
+    return 1;
+}
 /** @brief Current on-disk file format version. The decoder accepts only this
  *  version; Older versions are rejected with ZXC_ERROR_BAD_VERSION. */
 #define ZXC_FILE_FORMAT_VERSION 9
@@ -355,7 +366,7 @@ extern "C" {
 /** @brief Assumed CPU cache line size for alignment. */
 #define ZXC_CACHE_LINE_SIZE 64
 /** @brief Bitmask for cache-line alignment checks. */
-#define ZXC_ALIGNMENT_MASK (ZXC_CACHE_LINE_SIZE - 1)
+#define ZXC_ALIGNMENT_MASK ((size_t)ZXC_CACHE_LINE_SIZE - 1)
 /** @brief Round @p x up to the next cache-line boundary. */
 #define ZXC_ALIGN_CL(x) (((x) + ZXC_ALIGNMENT_MASK) & ~(size_t)ZXC_ALIGNMENT_MASK)
 
@@ -2132,6 +2143,93 @@ int zxc_write_file_header(uint8_t* RESTRICT dst, const size_t dst_capacity, cons
 int zxc_read_file_header(const uint8_t* RESTRICT src, const size_t src_size, size_t* out_block_size,
                          int* out_has_checksum, uint32_t* out_dict_id, int* out_has_seek);
 
+/** @brief The verdict on @p n bytes too short for a frame: the header speaks first,
+ *  then @ref ZXC_ERROR_SRC_TOO_SMALL. */
+static inline int zxc_short_input_verdict(const uint8_t* p, const size_t n) {
+    size_t chunk = 0;
+    const int rc = zxc_read_file_header(p, n < ZXC_FILE_HEADER_SIZE ? n : ZXC_FILE_HEADER_SIZE,
+                                        &chunk, NULL, NULL, NULL);
+    return rc != ZXC_OK ? rc : ZXC_ERROR_SRC_TOO_SMALL;
+}
+
+// ---------------------------------------------------------------------------
+// Container scan: frames back to back, measured without decoding (FORMAT.md,
+// Sec 2.1).
+// ---------------------------------------------------------------------------
+
+/**
+ * @struct zxc_scan_src_t
+ * @brief Where a container scan reads from: memory, or a positioned callback
+ *        (the FILE* size query). Offsets are relative to the container start.
+ */
+typedef struct zxc_scan_src_s {
+    /** Reads @p len bytes at @p off; NULL reads from @c data. Returns
+     *  @ref ZXC_OK or a negative @ref zxc_error_t. Bounds are checked first. */
+    int (*read_at)(const struct zxc_scan_src_s* src, uint64_t off, void* dst, size_t len);
+    const uint8_t* data; /**< Container bytes when @c read_at is NULL. */
+    void* ctx;           /**< Opaque state for @c read_at. */
+    uint64_t size;       /**< Container size in bytes. */
+} zxc_scan_src_t;
+
+/** @brief A scan source over @p size bytes of memory at @p data. */
+static ZXC_ALWAYS_INLINE zxc_scan_src_t zxc_scan_src_mem(const uint8_t* data, const size_t size) {
+    zxc_scan_src_t src = {NULL, data, NULL, (uint64_t)size};
+    return src;
+}
+
+/** @brief What @ref zxc_scan_container learns about a container. */
+typedef struct {
+    uint64_t dsize;         /**< Sum of the stored decompressed sizes. */
+    uint64_t frames;        /**< ZXC frames. */
+    uint32_t first_dict_id; /**< Dictionary id of the first frame, 0 without one. */
+    int uses_dict;          /**< A frame bound to a dictionary. */
+} zxc_container_info_t;
+
+/**
+ * @brief Tells whether a frame starts at @p pos.
+ *
+ * A wrong magic word is @ref ZXC_ERROR_BAD_MAGIC at offset 0, as for a single
+ * frame, and @ref ZXC_ERROR_CORRUPT_DATA after one.
+ *
+ * @param[in] src  Container source.
+ * @param[in] pos  Offset just past the previous frame, 0 for the first.
+ * @return 1 on a frame, 0 at the end of the input, or a negative @ref zxc_error_t.
+ */
+int zxc_container_next(const zxc_scan_src_t* src, uint64_t pos);
+
+/**
+ * @brief Measures the frame ending at @p end without decoding: its footer's
+ *        compressed size gives where it starts.
+ *
+ * @param[in]  src   Container source.
+ * @param[in]  end   Offset just past the frame.
+ * @param[out] start Offset of the frame's header.
+ * @param[out] info  Its header and footer, checked like zxc_get_frame_info().
+ * @param[out] footer_len Footer bytes, digest included; may be NULL.
+ * @return @ref ZXC_OK, or a negative @ref zxc_error_t.
+ */
+int zxc_scan_frame(const zxc_scan_src_t* src, uint64_t end, uint64_t* start, zxc_frame_info_t* info,
+                   size_t* footer_len);
+
+/**
+ * @brief The frame that must span all of @p src: zxc_get_frame_info() and its
+ *        FILE* twin. The header speaks first, then @ref zxc_scan_frame; a frame
+ *        starting past offset 0 is @ref ZXC_ERROR_CORRUPT_DATA.
+ */
+int zxc_scan_whole_frame(const zxc_scan_src_t* src, zxc_frame_info_t* info, size_t* footer_len);
+
+/**
+ * @brief Measures a whole container without decoding: frames from the last back
+ *        to the first through @ref zxc_scan_frame.
+ *
+ * @param[in]  src       Container source.
+ * @param[in]  req_chunk Block size every frame must declare, 0 for any.
+ * @param[out] info      Totals over the container.
+ * @return @ref ZXC_OK, or a negative @ref zxc_error_t; an empty container is
+ *         @ref ZXC_ERROR_SRC_TOO_SMALL.
+ */
+int zxc_scan_container(const zxc_scan_src_t* src, size_t req_chunk, zxc_container_info_t* info);
+
 /**
  * @brief Encodes a block header into @p dst.
  *
@@ -2167,29 +2265,126 @@ int zxc_read_block_header(const uint8_t* RESTRICT src, const size_t src_size,
                           zxc_block_header_t* bh);
 
 /**
- * @brief Writes the ZXC file footer into @p dst.
+ * @name File footer
+ * @brief `[digest(8), with checksums] | original_size | compressed_size | L` (FORMAT.md Sec 8).
  *
- * The original uncompressed size (@c ZXC_FILE_FOOTER_SIZE, 8 bytes, always first),
- * then the archive digest when checksums are on.
- *
- * @param[out] dst               Destination buffer.
- * @param[in]  dst_capacity      Total capacity of @p dst in bytes.
- * @param[in]  src_size          Original uncompressed size of the data.
- * @param[in]  digest            Archive digest, written after the size when
- *                               @p checksum_enabled.
- * @param[in]  checksum_enabled  Non-zero to emit the digest.
- *
- * @return Number of bytes written (8, or 16 with a digest) on success,
- *         or @c ZXC_ERROR_DST_TOO_SMALL on failure.
+ * Sizes on the fewest little-endian bytes (1 to 8); L = (nd - 1) | (nf - 1) << 4
+ * gives their lengths, so the footer parses back from the end without the
+ * header. A sequential reader computes the one valid footer and compares.
+ * @{
  */
-int zxc_write_file_footer(uint8_t* RESTRICT dst, const size_t dst_capacity, const uint64_t src_size,
-                          const uint64_t digest, const int checksum_enabled);
 
-/** @brief Footer bytes at the end of an archive: base size, plus the digest when
- *  @p checksum_enabled. */
-static ZXC_ALWAYS_INLINE size_t zxc_footer_bytes(const int checksum_enabled) {
-    return ZXC_FILE_FOOTER_SIZE + (checksum_enabled ? (size_t)ZXC_FILE_DIGEST_SIZE : 0U);
+/** @brief Fewest little-endian bytes, 1 to 8, that hold @p v. */
+static ZXC_ALWAYS_INLINE size_t zxc_uint_bytes(const uint64_t v) {
+    size_t n = 1;
+    while (n < sizeof(uint64_t) && (v >> (8 * n)) != 0) n++;
+    return n;
 }
+
+/** @brief Where a frame's footer lies, from what precedes it. */
+typedef struct {
+    size_t skip;              /**< Digest bytes ahead of the sizes, 0 or 8. */
+    size_t nd;                /**< Bytes of original_size. */
+    size_t nf;                /**< Bytes of compressed_size. */
+    size_t len;               /**< Footer bytes, digest included. */
+    uint64_t compressed_size; /**< The frame's bytes, footer included. */
+} zxc_footer_layout_t;
+
+/**
+ * @brief The footer of a frame whose first @p prefix bytes precede it.
+ *
+ * compressed_size counts its own bytes: nf is the fewest that hold the total, a
+ * unique choice both ends derive.
+ */
+static ZXC_ALWAYS_INLINE zxc_footer_layout_t zxc_footer_layout(const uint64_t prefix,
+                                                               const uint64_t src_size,
+                                                               const int checksum_enabled) {
+    zxc_footer_layout_t l;
+    l.skip = checksum_enabled ? (size_t)ZXC_FILE_DIGEST_SIZE : 0U;
+    l.nd = zxc_uint_bytes(src_size);
+    const uint64_t base = prefix + l.skip + l.nd + 1;
+    l.nf = 1;
+    while (zxc_uint_bytes(base + l.nf) > l.nf) l.nf++;
+    l.compressed_size = base + l.nf;
+    l.len = l.skip + l.nd + l.nf + 1;
+    return l;
+}
+
+/**
+ * @brief Writes the footer of a frame whose first @p prefix bytes precede it.
+ *
+ * @return Bytes written (@ref ZXC_FILE_FOOTER_MIN_SIZE to
+ *         @ref ZXC_FILE_FOOTER_MAX_SIZE, plus the digest when
+ *         @p checksum_enabled), or @c ZXC_ERROR_DST_TOO_SMALL.
+ */
+int zxc_write_file_footer(uint8_t* RESTRICT dst, const size_t dst_capacity, const uint64_t prefix,
+                          const uint64_t src_size, const uint64_t digest,
+                          const int checksum_enabled);
+
+/**
+ * @brief Checks the footer a sequential reader reaches against @p l, the one
+ *        the frame implies, on the @p avail bytes it has.
+ *
+ * Compares only the bytes present: a mismatch is corruption, a matching but
+ * short prefix a truncation.
+ *
+ * @param[out] digest  The stored digest, 0 without checksums; may be NULL.
+ * @return @ref ZXC_OK, @ref ZXC_ERROR_CORRUPT_DATA or @ref ZXC_ERROR_SRC_TOO_SMALL.
+ */
+int zxc_check_file_footer(const uint8_t* footer, size_t avail, const zxc_footer_layout_t* l,
+                          uint64_t src_size, uint64_t* digest);
+
+/**
+ * @brief Parses the sizes back from the end of a frame.
+ *
+ * @param[in]  end             One past the frame's last byte.
+ * @param[in]  avail           Bytes readable before @p end.
+ * @param[out] src_size        Stored original size.
+ * @param[out] compressed_size Stored compressed size of the frame.
+ * @param[out] sizes_len       Bytes of the two sizes and L; the digest, when
+ *                             the header announces one, precedes them.
+ * @return @ref ZXC_OK, @ref ZXC_ERROR_SRC_TOO_SMALL, or
+ *         @ref ZXC_ERROR_CORRUPT_DATA for a malformed lengths byte or a
+ *         non-minimal length.
+ */
+int zxc_parse_file_footer(const uint8_t* end, size_t avail, uint64_t* src_size,
+                          uint64_t* compressed_size, size_t* sizes_len);
+
+/** @brief Most bytes a footer spans: the digest and the two longest sizes. */
+#define ZXC_FOOTER_MAX_SIZE_WITH_DIGEST (ZXC_FILE_DIGEST_SIZE + ZXC_FILE_FOOTER_MAX_SIZE)
+
+/** @brief Smallest frame: header, the EOF block and the shortest footer. */
+#define ZXC_FRAME_MIN_SIZE (ZXC_FILE_HEADER_SIZE + ZXC_BLOCK_HEADER_SIZE + ZXC_FILE_FOOTER_MIN_SIZE)
+
+/** @brief Bytes zxc_read_frame_info() takes from the end of @p total bytes, at
+ *  least @ref ZXC_FRAME_MIN_SIZE: all of them past the header and EOF block, up
+ *  to @ref ZXC_FOOTER_MAX_SIZE_WITH_DIGEST. */
+static inline size_t zxc_frame_tail_len(const uint64_t total) {
+    const uint64_t body = total - (ZXC_FILE_HEADER_SIZE + ZXC_BLOCK_HEADER_SIZE);
+    return body < ZXC_FOOTER_MAX_SIZE_WITH_DIGEST ? (size_t)body : ZXC_FOOTER_MAX_SIZE_WITH_DIGEST;
+}
+
+/**
+ * @brief Validates a frame from its header and the end of its bytes: the one
+ *        check behind zxc_get_frame_info(), its FILE* twin and the size queries.
+ *
+ * @param[in]  header     The first @ref ZXC_FILE_HEADER_SIZE bytes.
+ * @param[in]  tail       The last @p tail_len bytes, @p tail_len being
+ *                        @ref zxc_frame_tail_len of @p total.
+ * @param[in]  total      Bytes of the whole input.
+ * @param[out] info       Filled on success.
+ * @param[out] footer_len Footer bytes, digest included; may be NULL.
+ * @return @ref ZXC_OK, or a negative @ref zxc_error_t.
+ */
+int zxc_read_frame_info(const uint8_t* header, const uint8_t* tail, size_t tail_len, uint64_t total,
+                        zxc_frame_info_t* info, size_t* footer_len);
+
+/** @brief Copies the fields of @p got that fit the caller's @p info_size bytes. */
+static ZXC_ALWAYS_INLINE void zxc_frame_info_copy(zxc_frame_info_t* info, const size_t info_size,
+                                                  const zxc_frame_info_t* got) {
+    ZXC_MEMCPY(info, got, info_size < sizeof(*got) ? info_size : sizeof(*got));
+}
+/** @} */
 
 /**
  * @brief Whether a footer's decompressed size is reachable for this archive.
@@ -2213,56 +2408,44 @@ static ZXC_ALWAYS_INLINE int zxc_footer_dsize_plausible(const uint64_t dsize,
 }
 
 /**
- * @brief Validates the SEK block header the file header announced.
+ * @brief Writes a seek table's block header for @p num_blocks entries.
  *
- * The flag says where the table is; this says whether it is the one the archive
- * needs: @ref zxc_seek_size_field of its @ref zxc_seek_table_bytes. The sequential
- * readers share it so they drain the same number of bytes: the full 64-bit count,
- * not the field.
+ * Shared by the writers and by the readers, which compare against it.
  *
- * @param[in]  hdr         The 8 bytes after the EOF block.
- * @param[in]  total_out   Bytes decoded: the archive's source size.
- * @param[in]  block_size  Block size from the file header.
- * @param[out] sek_bytes   The SEK payload length when valid; untouched otherwise.
- * @return 1 for the expected SEK header, 0 otherwise.
+ * @param[out] dst          Destination, at least @ref ZXC_BLOCK_HEADER_SIZE bytes.
+ * @param[in]  dst_capacity Size of @p dst.
+ * @param[in]  num_blocks   Blocks the table indexes.
+ * @return @ref ZXC_BLOCK_HEADER_SIZE, or a negative @ref zxc_error_t.
  */
-static ZXC_ALWAYS_INLINE int zxc_seek_header_ok(const uint8_t* hdr, const uint64_t total_out,
-                                                const size_t block_size, uint64_t* sek_bytes) {
-    zxc_block_header_t bh;
-    if (zxc_read_block_header(hdr, ZXC_BLOCK_HEADER_SIZE, &bh) != ZXC_OK ||
-        bh.block_type != ZXC_BLOCK_SEK)
-        return 0;
-    const uint64_t table = zxc_seek_table_bytes(zxc_seek_block_count(total_out, block_size));
-    if (zxc_seek_size_field(table) != bh.comp_size) return 0;
-    *sek_bytes = table;
-    return 1;
-}
+int zxc_seek_table_header(uint8_t* dst, size_t dst_capacity, uint64_t num_blocks);
 
 /**
- * @brief Whether the bytes between the EOF block and the footer are the tail the
- *        header announced.
+ * @brief Checks an EOF block header against its one valid form: type 255, every
+ *        other field zero, and its header checksum.
  *
- * Nothing without @ref ZXC_FILE_FLAG_HAS_SEEK_TABLE, exactly one well-formed SEK
- * block with it (Sec 5.5). Skipping the gap to reach the footer passes inserted
- * bytes as sound, size and digest both being computed from the decoded bytes and
- * blind to it.
- *
- * @param[in] gap        First byte after the EOF block header.
- * @param[in] gap_len    Bytes between that point and the footer.
- * @param[in] has_seek   Seek-table flag from the file header.
- * @param[in] total_out  Bytes decoded: what the SEK table would describe.
- * @param[in] block_size Block size from the file header.
- * @return 1 when the gap matches the flag, 0 otherwise.
+ * @param[in] hdr The 8 header bytes, already read as an EOF block.
+ * @return @ref ZXC_OK or @ref ZXC_ERROR_BAD_HEADER.
  */
-static ZXC_ALWAYS_INLINE int zxc_tail_gap_ok(const uint8_t* gap, const uint64_t gap_len,
-                                             const int has_seek, const uint64_t total_out,
-                                             const size_t block_size) {
-    if (!has_seek) return gap_len == 0;
-    uint64_t sek_bytes = 0;
-    return gap_len >= ZXC_BLOCK_HEADER_SIZE &&
-           zxc_seek_header_ok(gap, total_out, block_size, &sek_bytes) &&
-           gap_len - ZXC_BLOCK_HEADER_SIZE == sek_bytes;
-}
+int zxc_check_eof_header(const uint8_t* hdr);
+
+/**
+ * @brief Checks the SEK block header the file header announced, on the @p avail
+ *        bytes present.
+ *
+ * A frame admits one header, the one zxc_seek_table_header() writes (reserved
+ * bytes zero), compared like the footer. A short footer never matches its start,
+ * so a flag set without a table reads as corrupt, not truncated.
+ *
+ * @param[in]  hdr        Bytes after the EOF block.
+ * @param[in]  avail      How many of them are present.
+ * @param[in]  total_out  Bytes the frame decoded to.
+ * @param[in]  block_size Block size from the file header.
+ * @param[out] sek_bytes  Table length in 64 bits (the field only holds its fold);
+ *                        may be NULL.
+ * @return @ref ZXC_OK, @ref ZXC_ERROR_CORRUPT_DATA or @ref ZXC_ERROR_SRC_TOO_SMALL.
+ */
+int zxc_check_seek_header(const uint8_t* hdr, size_t avail, uint64_t total_out, size_t block_size,
+                          uint64_t* sek_bytes);
 
 // ---------------------------------------------------------------------------
 // Seekable cross-TU hooks (defined in zxc_seekable.c, consumed by the
@@ -2283,15 +2466,6 @@ static ZXC_ALWAYS_INLINE int zxc_tail_gap_ok(const uint8_t* gap, const uint64_t 
  * @param[in]     ctx  Pointer previously returned by @c ZXC_MALLOC / @c ZXC_CALLOC.
  */
 void zxc_seekable_attach_owned_ctx(zxc_seekable* s, void* ctx);
-
-/**
- * @brief Writes a seek table's block header for @p num_blocks entries.
- *
- * Shared by the frame and streaming writers, which emit the entries after it.
- *
- * @return @ref ZXC_BLOCK_HEADER_SIZE, or a negative @ref zxc_error_t.
- */
-int zxc_seek_table_header(uint8_t* dst, size_t dst_capacity, uint64_t num_blocks);
 
 /**
  * @brief Writes one group (@p *anchor, then @p cnt sizes) into @p dst, which holds

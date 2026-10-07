@@ -19,6 +19,10 @@
  * block count and no table stays in memory. A header flag announces it; plain
  * decompressors skip it and refuse a tail that disagrees.
  *
+ * Seekable archives concatenated read as one: blocks and offsets run across the
+ * frames, at most 2^20 of them. Every frame must carry a table; block sizes,
+ * checksums and dictionaries may differ.
+ *
  * No field holds the block count, so nothing caps it but the footer's 64-bit
  * size: counts and block indices are 64-bit here. Writing a table still costs
  * four bytes of memory per block, which is what limits a producer today.
@@ -137,10 +141,10 @@ typedef struct {
 /**
  * @brief Opens a seekable archive through a user-supplied reader.
  *
- * Three reads at open (file header, footer, EOF/SEK headers), then per range its
- * table groups and every block decoded. This is the entry point for backing the
- * seekable API with any storage that does positional reads (mmap, HTTP, S3, a
- * kernel file descriptor).
+ * Two reads per frame at open (at most 2^20 frames), plus the last frame's
+ * EOF/SEK headers; per range, its table groups and every block decoded. This is the entry point for
+ * backing the seekable API with any storage that does positional reads (mmap, HTTP, S3, a kernel
+ * file descriptor).
  *
  * @param[in] r  Reader interface (must remain valid for the handle lifetime).
  * @return Handle (0 blocks if the archive is empty), or @c NULL on error.
@@ -267,7 +271,8 @@ ZXC_EXPORT int zxc_seekable_set_checksum(zxc_seekable* s, int enabled);
  * @brief Attaches a pre-trained dictionary to a seekable handle.
  *
  * Content and table are copied, so the caller may free them once this returns.
- * Must happen before the first zxc_seekable_decompress_range() call.
+ * Call it once per dictionary the frames use; a range through a frame whose
+ * dictionary is missing returns @ref ZXC_ERROR_DICT_REQUIRED.
  *
  * @param[in] s         Seekable handle.
  * @param[in] dict      Dictionary content.
@@ -275,8 +280,9 @@ ZXC_EXPORT int zxc_seekable_set_checksum(zxc_seekable* s, int enabled);
  * @param[in] dict_huf  Shared literal Huffman table (128 bytes, see
  *                      zxc_dict_huf()), or NULL if the archive was compressed
  *                      without one. Must be the compression-time table: the
- *                      archive's dict_id binds the (dict, table) pair. Wrong or
- *                      missing: @ref ZXC_ERROR_DICT_MISMATCH, on this call.
+ *                      archive's dict_id binds the (dict, table) pair. A pair
+ *                      no frame uses: @ref ZXC_ERROR_DICT_MISMATCH, on this call,
+ *                      unless no frame needs a dictionary: then it is ignored.
  * @return @ref ZXC_OK on success, or a negative @ref zxc_error_t code.
  */
 ZXC_EXPORT int zxc_seekable_set_dict(zxc_seekable* s, const void* dict, size_t dict_size,

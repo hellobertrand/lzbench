@@ -127,6 +127,10 @@ ZXC_EXPORT int64_t zxc_compress(const void* src, const size_t src_size, void* ds
  * and blocking, so @c n_threads and the progress callback in @p opts are
  * ignored.
  *
+ * @par Concatenated frames
+ * @p src may hold several frames back to back; they decode in order into
+ * @p dst. Anything else after a frame is @ref ZXC_ERROR_CORRUPT_DATA.
+ *
  * @par Asking without a destination
  * A NULL @p dst, or a @p dst_capacity of 0, decodes nothing and reports what
  * the archive holds: 0 for a well-formed empty one, @ref ZXC_ERROR_DST_TOO_SMALL
@@ -198,12 +202,11 @@ ZXC_EXPORT int64_t zxc_decompress_inplace(void* buffer, const size_t buffer_capa
                                           const zxc_decompress_opts_t* opts);
 
 /**
- * @brief Reads the original size from an archive footer, without decoding.
+ * @brief Reads the original size from the archive footers, without decoding.
  *
- * The footer is untrusted input, so the value is checked for plausibility
- * against the archive size (each block costs at least a block header and
- * decodes to at most one block): a forged footer claiming an absurd size
- * returns 0 rather than driving an oversized allocation.
+ * Sums the sizes the footers store, walking the frames back from the end. Each
+ * frame is checked like zxc_get_frame_info(), its size against what its bytes
+ * can hold: a forged footer returns 0 rather than drive an oversized allocation.
  *
  * @param[in] src       Compressed buffer.
  * @param[in] src_size  Compressed size in bytes.
@@ -221,6 +224,71 @@ ZXC_EXPORT uint64_t zxc_get_decompressed_size(const void* src, const size_t src_
  * @return Dictionary ID, or 0 if no dictionary is required or the buffer is invalid.
  */
 ZXC_EXPORT uint32_t zxc_get_dict_id(const void* src, size_t src_size);
+
+/**
+ * @brief What a frame's header and footer declare, read without decoding.
+ *
+ * Filled by zxc_get_frame_info(), zxc_get_last_frame_info() and their FILE*
+ * twins; pass them `sizeof(zxc_frame_info_t)`. Fields are only ever added at
+ * the end: zero the struct first to read the ones this library does not know as 0.
+ */
+typedef struct {
+    uint64_t decompressed_size; /**< Source bytes the frame decodes to. */
+    uint64_t compressed_size;   /**< Compressed bytes of the frame, footer included. */
+    uint64_t digest;            /**< Archive digest; 0 when @c has_checksum is 0. */
+    size_t block_size;          /**< Block size, 4 KB to 2 MB. */
+    uint32_t dict_id;           /**< Dictionary the frame needs; 0 for none. */
+    uint8_t format_version;     /**< Format version of the frame. */
+    uint8_t has_checksum;       /**< 1 when blocks carry checksums and the footer a digest. */
+    uint8_t has_seek_table;     /**< 1 when a seek table precedes the footer. */
+} zxc_frame_info_t;
+
+/**
+ * @brief Reads a frame's header and footer, without decoding.
+ *
+ * Validates the header as a decoder would, parses the footer back from the end
+ * of @p src, and checks that the frame spans all of @p src and that its stored
+ * size is reachable. The blocks are not read, so a frame that passes may still
+ * fail to decode.
+ *
+ * @param[in]  src        Compressed buffer.
+ * @param[in]  src_size   Compressed size in bytes.
+ * @param[out] info       Filled on success, untouched otherwise.
+ * @param[in]  info_size  `sizeof(*info)` as the caller compiled it.
+ * @return @ref ZXC_OK, or a negative @ref zxc_error_t (e.g.
+ *         @ref ZXC_ERROR_BAD_MAGIC, @ref ZXC_ERROR_CORRUPT_DATA).
+ */
+ZXC_EXPORT int zxc_get_frame_info(const void* src, size_t src_size, zxc_frame_info_t* info,
+                                  size_t info_size);
+
+/**
+ * @brief Reads the last frame of @p src, without decoding.
+ *
+ * Same checks as zxc_get_frame_info(), but the frame starts at
+ * `src_size - info->compressed_size`, so concatenated frames walk back:
+ *
+ * @code
+ * size_t n = src_size;
+ * while (n > 0) {
+ *     if (zxc_get_last_frame_info(src, n, &info, sizeof(info)) != ZXC_OK) break;
+ *     n -= info.compressed_size;  // the frame before ends here
+ * }
+ * @endcode
+ *
+ * @param[in]  src        Compressed buffer.
+ * @param[in]  src_size   Bytes of @p src the frame ends.
+ * @param[out] info       Filled on success, untouched otherwise.
+ * @param[in]  info_size  `sizeof(*info)` as the caller compiled it.
+ * @return @ref ZXC_OK, or a negative @ref zxc_error_t.
+ */
+ZXC_EXPORT int zxc_get_last_frame_info(const void* src, size_t src_size, zxc_frame_info_t* info,
+                                       size_t info_size);
+
+/**
+ * @brief Returns `sizeof(zxc_frame_info_t)` as compiled into the library.
+ * @see zxc_compress_opts_size
+ */
+ZXC_EXPORT size_t zxc_frame_info_size(void);
 
 /* ========================================================================= */
 /*  Block-Level API (no file framing)                                        */
@@ -308,7 +376,8 @@ ZXC_EXPORT uint64_t zxc_decompress_block_bound(const size_t uncompressed_size);
  * @param[in]     opts         Compression options, or NULL for defaults.
  *                             @c level, @c block_size, @c checksum_enabled and
  *                             the dictionary fields are used; the shared table
- *                             is rebuilt only when it changes.
+ *                             is rebuilt only when it changes. @c seekable is
+ *                             ignored and not remembered.
  *
  * @note @p src and @p dst must not overlap (same contract as memcpy).
  *
@@ -466,14 +535,16 @@ ZXC_EXPORT void zxc_free_cctx(zxc_cctx* cctx);
  * raise returns @ref ZXC_ERROR_BAD_LEVEL instead, since the workspace cannot
  * grow.
  *
- * Options are **sticky**: values passed in @p opts are remembered and reused
- * on later calls that pass NULL, starting from those given to
- * zxc_create_cctx(). Levels above @ref ZXC_LEVEL_ULTRA are silently clamped.
+ * Options are **sticky**: each entry point remembers the options it uses for
+ * later calls that pass NULL, starting from zxc_create_cctx(): level,
+ * block_size, checksum_enabled and seekable here, the first three for
+ * zxc_compress_block(). Levels above @ref ZXC_LEVEL_ULTRA are silently clamped.
  * Dictionary options are the exception: honoured as in zxc_compress() but
  * never remembered, so pass them on every call; the shared table is rebuilt
  * only when it changes. A static context returns
- * @ref ZXC_ERROR_DICT_UNSUPPORTED for any dictionary. @c seekable is ignored
- * here: use zxc_compress() when the archive needs a seek table.
+ * @ref ZXC_ERROR_DICT_UNSUPPORTED for any dictionary. @c seekable appends the
+ * seek table as zxc_compress() does, without allocating, static contexts
+ * included.
  *
  * @param[in,out] cctx         Reusable compression context.
  * @param[in]     src          Source data; may be NULL when @p src_size is 0.
