@@ -1288,7 +1288,10 @@ typedef struct {
     zxc_dctx *dctx;
 } zxc_bench_t;
 
-char *lzbench_zxc_init(size_t insize, size_t level, size_t)
+/* split_budget: 0 = plain zxc; otherwise --favor-decode-speed=<split_budget>
+   (1-100, the comp_desc additional_param). ZXC_SPLIT_BUDGET_PCT in the
+   environment overrides a non-zero one, for a sweep without rebuilding. */
+char *lzbench_zxc_init(size_t insize, size_t level, size_t split_budget)
 {
     zxc_bench_t *bench = (zxc_bench_t *)malloc(sizeof(zxc_bench_t));
     if (!bench)
@@ -1298,6 +1301,12 @@ char *lzbench_zxc_init(size_t insize, size_t level, size_t)
     copts.level = (int)level;
     /* 0 = default block size (512KB); otherwise a power of 2 in [4KB, 2MB]. */
     copts.block_size = 0;
+    if (split_budget) {
+        const char *env = getenv("ZXC_SPLIT_BUDGET_PCT");
+        if (env && atoi(env) > 0) split_budget = (size_t)atoi(env);
+        copts.favor_decode_speed = 1;
+        copts.split_budget_pct = (int)split_budget;
+    }
 
     bench->cctx = zxc_create_cctx(&copts);
     bench->dctx = zxc_create_dctx();
