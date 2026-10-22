@@ -58,6 +58,12 @@
 #define ZXC_BLOCK_SIZE_MAX_LOG2 21
 /** @brief Default block size (512 KB). */
 #define ZXC_BLOCK_SIZE_DEFAULT (512 * 1024)
+/** @brief zxc_compress_opts_t::split_budget_pct used for 0: the measured knee
+ *         of decode speed against size. */
+#define ZXC_SPLIT_BUDGET_DEFAULT 10
+/** @brief Widest zxc_compress_opts_t::split_budget_pct: a block may double;
+ *         larger values read as this one. */
+#define ZXC_SPLIT_BUDGET_MAX 100
 /** @brief Minimum allowed block size (4 KB = 2^12). */
 #define ZXC_BLOCK_SIZE_MIN (1U << ZXC_BLOCK_SIZE_MIN_LOG2)
 /** @brief Maximum allowed block size (2 MB = 2^21). */

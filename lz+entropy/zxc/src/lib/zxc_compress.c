@@ -7,7 +7,7 @@
 
 /**
  * @file zxc_compress.c
- * @brief Block-level compression: LZ77 parsing, GLO / GHI / RAW encoding,
+ * @brief Block-level compression: LZ77 parsing, SPL / PAK / RAW encoding,
  *        and the chunk-wrapper entry point.
  *
  * Compiled multiple times with different @c ZXC_FUNCTION_SUFFIX values to
@@ -239,7 +239,7 @@ static ZXC_ALWAYS_INLINE int zxc_emit_extra(uint8_t* RESTRICT extras, size_t* RE
 }
 
 /**
- * @brief Emits one GLO sequence (token, offset, LL/ML escapes) and updates
+ * @brief Emits one SPL sequence (token, offset, LL/ML escapes) and updates
  *        @p max_offset, the block's widest biased offset.
  *
  * @param[out]    buf_tokens  Token stream; the token goes at index @p *seq_c.
@@ -254,7 +254,7 @@ static ZXC_ALWAYS_INLINE int zxc_emit_extra(uint8_t* RESTRICT extras, size_t* RE
  * @return 1, or 0 when a length exceeds ZXC_MAX_VARINT_VALUE. The extras buffer
  *         is sized by the layout, not checked here.
  */
-static ZXC_ALWAYS_INLINE int zxc_glo_put_seq(uint8_t* RESTRICT buf_tokens,
+static ZXC_ALWAYS_INLINE int zxc_spl_put_seq(uint8_t* RESTRICT buf_tokens,
                                              uint16_t* RESTRICT buf_offsets,
                                              uint8_t* RESTRICT buf_extras, uint32_t* RESTRICT seq_c,
                                              size_t* RESTRICT extras_sz,
@@ -287,15 +287,15 @@ static ZXC_ALWAYS_INLINE void zxc_varint_keep(uint8_t* extras, size_t* RESTRICT 
 }
 
 /** @brief Inline pieces a match of length code @p code splits into: ceil(length / 19). */
-static ZXC_ALWAYS_INLINE uint32_t zxc_glo_split_pieces(const uint32_t code) {
-    return (code + ZXC_LZ_MIN_MATCH_LEN + ZXC_GLO_MAX_INLINE_ML - 1) / ZXC_GLO_MAX_INLINE_ML;
+static ZXC_ALWAYS_INLINE uint32_t zxc_spl_match_split_pieces(const uint32_t code) {
+    return (code + ZXC_LZ_MIN_MATCH_LEN + ZXC_SPL_MAX_INLINE_ML - 1) / ZXC_SPL_MAX_INLINE_ML;
 }
 
 /** @brief Next piece of a match of length code @p code above the inline reach: the
  *         longest inline one that leaves at least a minimum match. */
-static ZXC_ALWAYS_INLINE uint32_t zxc_glo_split_piece(const uint32_t code) {
+static ZXC_ALWAYS_INLINE uint32_t zxc_spl_match_split_piece(const uint32_t code) {
     const uint32_t rest = code - ZXC_LZ_MIN_MATCH_LEN;
-    return (rest < ZXC_GLO_INLINE_ML_CODE) ? rest : ZXC_GLO_INLINE_ML_CODE;
+    return (rest < ZXC_SPL_INLINE_ML_CODE) ? rest : ZXC_SPL_INLINE_ML_CODE;
 }
 
 /**
@@ -307,16 +307,16 @@ static ZXC_ALWAYS_INLINE uint32_t zxc_glo_split_piece(const uint32_t code) {
  * lanes keep an inline run off one store-forwarding chain.
  *
  * @return 1 when the minority counts, a static predictor's misses, reach
- *         ZXC_GLO_SPLIT_MIN_MISPREDICT_PCT of the escapes and some escape sits
+ *         ZXC_SPL_MATCH_SPLIT_MIN_MISPREDICT_PCT of the escapes and some escape sits
  *         in a bad context, so that a split can happen; else 0.
  */
-static int zxc_glo_split_analyze(const uint8_t* RESTRICT tokens, const uint32_t n_seq,
-                                 zxc_glo_split_hist_t* RESTRICT hist_buf, uint8_t* RESTRICT ctx_bad,
-                                 uint8_t* RESTRICT side) {
-    uint32_t order = ZXC_GLO_SPLIT_CTX_BITS;
+static int zxc_spl_match_split_analyze(const uint8_t* RESTRICT tokens, const uint32_t n_seq,
+                                       zxc_spl_match_split_hist_t* RESTRICT hist_buf,
+                                       uint8_t* RESTRICT ctx_bad, uint8_t* RESTRICT side) {
+    uint32_t order = ZXC_SPL_MATCH_SPLIT_CTX_BITS;
     while (order > 2 && (n_seq >> order) < 16) order--;
     const uint32_t hmask = (1U << order) - 1U;
-    uint32_t (*const ctx_hist)[2][1U << ZXC_GLO_SPLIT_CTX_BITS] = *hist_buf;
+    uint32_t (*const ctx_hist)[2][1U << ZXC_SPL_MATCH_SPLIT_CTX_BITS] = *hist_buf;
     for (uint32_t l = 0; l < 4; l++) {
         ZXC_MEMSET(ctx_hist[l][0], 0, (hmask + 1) * sizeof(uint32_t));
         ZXC_MEMSET(ctx_hist[l][1], 0, (hmask + 1) * sizeof(uint32_t));
@@ -341,25 +341,79 @@ static int zxc_glo_split_analyze(const uint8_t* RESTRICT tokens, const uint32_t 
         errors += (n0 < n1) ? n0 : n1;
     }
     return bad_esc != 0 &&
-           (uint64_t)errors * 100 >= (uint64_t)ZXC_GLO_SPLIT_MIN_MISPREDICT_PCT * n_esc;
+           (uint64_t)errors * 100 >= (uint64_t)ZXC_SPL_MATCH_SPLIT_MIN_MISPREDICT_PCT * n_esc;
+}
+
+/**
+ * @brief The longest length code a block splits under its growth budget.
+ *
+ * Every escape is worth removing (about 20 cycles when taken, a piece about
+ * 4), so size is what bounds the split: the block may grow by @p budget_pct
+ * percent of its estimated size (tokens, offsets, extras, literals), and the
+ * cap is the longest length code, shortest escapes first, whose matches all
+ * fit what is left of that budget. A split match drops its varint (one byte:
+ * the code is below 128) for pieces - 1 extra sequences.
+ *
+ * @param[in] tokens     The block's tokens.
+ * @param[in] extras     Its extras.
+ * @param[in] extras_sz  Bytes used in @p extras.
+ * @param[in] n_seq      Sequence count of the block.
+ * @param[in] lit_c      Its literal bytes.
+ * @param[in] off_bytes  Bytes per offset on the wire, 1 or 2.
+ * @param[out] hist      Scratch, ZXC_SPL_MATCH_SPLIT_MAX + 1 counters.
+ * @param[in] budget_pct zxc_cctx_t::split_budget_pct, non-zero.
+ * @return The longest code with an escape that fits, at most
+ *         ZXC_SPL_MATCH_SPLIT_MAX; ZXC_SPL_INLINE_ML_CODE when none does.
+ */
+static uint32_t zxc_spl_match_split_budget_cap(const uint8_t* RESTRICT tokens,
+                                               const uint8_t* RESTRICT extras,
+                                               const size_t extras_sz, const uint32_t n_seq,
+                                               const size_t lit_c, const size_t off_bytes,
+                                               uint32_t* RESTRICT hist, const uint32_t budget_pct) {
+    const uint8_t* const extras_end = extras + extras_sz;
+    ZXC_MEMSET(hist, 0, (ZXC_SPL_MATCH_SPLIT_MAX + 1) * sizeof(uint32_t));
+    const uint8_t* p = extras;
+    for (uint32_t i = 0; i < n_seq; i++) {
+        const uint8_t tok = tokens[i];
+        if ((tok >> ZXC_TOKEN_LIT_BITS) == ZXC_TOKEN_LL_MASK) (void)zxc_read_varint(&p, extras_end);
+        if ((tok & ZXC_TOKEN_ML_MASK) != ZXC_TOKEN_ML_MASK) continue;
+        const uint32_t code = zxc_read_varint(&p, extras_end) + ZXC_TOKEN_ML_MASK;
+        if (code <= ZXC_SPL_MATCH_SPLIT_MAX) hist[code]++;
+    }
+    const size_t seq_bytes = 1 + off_bytes;
+    size_t budget = (n_seq * seq_bytes + extras_sz + lit_c) * budget_pct / 100;
+    uint32_t cap = ZXC_SPL_INLINE_ML_CODE;
+    for (uint32_t c = ZXC_TOKEN_ML_MASK; c <= ZXC_SPL_MATCH_SPLIT_MAX; c++) {
+        if (hist[c] == 0) continue;
+        const size_t cost = hist[c] * ((zxc_spl_match_split_pieces(c) - 1) * seq_bytes - 1);
+        if (cost > budget) break;
+        budget -= cost;
+        cap = c;
+    }
+    return cap;
 }
 
 /**
  * @brief Per-block match splitting: escaped matches re-emitted as inline pieces.
  *
- * A match whose length code exceeds the inline reach but not @p cap becomes a
+ * A match whose length code exceeds the inline reach but not the cap becomes a
  * chain of inline matches at the same offset: the decoder never takes its ML
- * escape. Each extra piece costs a token and an offset, less the varint it
- * replaces.
+ * escape. Each piece costs a token and an offset, less the varint it replaces.
  *
- * Two gates (zxc_glo_split_analyze): the block must look mispredicted, which
- * leaves regular data whole, then only escapes of mispredicted contexts split.
+ * Two caps, a match splits under either. The gated one, the level's
+ * @p gate_max (levels 3-5): the block must look mispredicted, which leaves
+ * regular data whole, then only escapes of mispredicted contexts split
+ * (zxc_spl_match_split_analyze). With favor_decode_speed (@p budget_pct > 0)
+ * every escape splits, up to the cap the growth budget allows
+ * (zxc_spl_match_split_budget_cap): the option never splits less than the
+ * default.
  *
- * In place: pass 1 turns @p side from each sequence's context into its length
- * code to split (0 = keep) and compacts the kept extras forward; pass 2 expands
- * tokens and offsets backward, each write at or past its read. A piece
- * consumes at least ZXC_LZ_MIN_MATCH_LEN input bytes, so the count fits the
- * block's sequence buffers.
+ * In place: pass 0 picks the caps; pass 1 turns @p side
+ * into each sequence's length code to split (0 = keep) and
+ * compacts the kept extras forward; pass 2 expands tokens and offsets
+ * backward, each write at or past its read. A piece consumes at least
+ * ZXC_LZ_MIN_MATCH_LEN input bytes, so the count fits the block's sequence
+ * buffers.
  *
  * @param[in,out] tokens    The block's tokens, rewritten in place.
  * @param[in,out] offsets   Its offsets, rewritten in place.
@@ -368,34 +422,50 @@ static int zxc_glo_split_analyze(const uint8_t* RESTRICT tokens, const uint32_t 
  * @param[out]    side      Scratch, one byte per sequence (zxc_cctx_t::buf_split).
  * @param[out]    hist_buf  Scratch (zxc_cctx_t::buf_split_hist).
  * @param[in]     n_seq     Sequence count of the block.
- * @param[in]     cap       zxc_lz77_params_t::split_max.
+ * @param[in]     lit_c     Its literal bytes.
+ * @param[in]     off_bytes Bytes per offset on the wire, 1 or 2.
+ * @param[in]     gate_max  zxc_lz77_params_t::split_max.
+ * @param[in]     budget_pct zxc_cctx_t::split_budget_pct; 0 = no budget cap.
  * @return The new sequence count (unchanged when the block is not split).
  */
-static uint32_t zxc_glo_split_block(uint8_t* RESTRICT tokens, uint16_t* RESTRICT offsets,
-                                    uint8_t* RESTRICT extras, size_t* RESTRICT extras_sz,
-                                    uint8_t* RESTRICT side, zxc_glo_split_hist_t* RESTRICT hist_buf,
-                                    const uint32_t n_seq, const uint8_t cap) {
-    if (cap <= ZXC_GLO_INLINE_ML_CODE || n_seq == 0) return n_seq;
-    uint8_t ctx_bad[1U << ZXC_GLO_SPLIT_CTX_BITS];
-    if (!zxc_glo_split_analyze(tokens, n_seq, hist_buf, ctx_bad, side)) return n_seq;
-
-    // 1. Mark the matches to split (bad context, within the cap) and drop their
-    // varints; the other extras move forward.
+static uint32_t zxc_spl_match_split_block(uint8_t* RESTRICT tokens, uint16_t* RESTRICT offsets,
+                                          uint8_t* RESTRICT extras, size_t* RESTRICT extras_sz,
+                                          uint8_t* RESTRICT side,
+                                          zxc_spl_match_split_hist_t* RESTRICT hist_buf,
+                                          const uint32_t n_seq, const size_t lit_c,
+                                          const size_t off_bytes, const uint8_t gate_max,
+                                          const uint8_t budget_pct) {
+    if (n_seq == 0) return n_seq;
     const uint8_t* const extras_end = extras + *extras_sz;
+    uint8_t ctx_bad[1U << ZXC_SPL_MATCH_SPLIT_CTX_BITS];
+
+    // 0. The budget's cap over every escape, then the gate's over the
+    // mispredicted ones; the histograms share the scratch, one after the other.
+    uint32_t all_cap = ZXC_SPL_INLINE_ML_CODE, gate_cap = ZXC_SPL_INLINE_ML_CODE;
+    if (budget_pct)
+        all_cap = zxc_spl_match_split_budget_cap(tokens, extras, *extras_sz, n_seq, lit_c,
+                                                 off_bytes, (*hist_buf)[0][0], budget_pct);
+    if (gate_max > ZXC_SPL_INLINE_ML_CODE &&
+        zxc_spl_match_split_analyze(tokens, n_seq, hist_buf, ctx_bad, side))
+        gate_cap = gate_max;
+    if (all_cap == ZXC_SPL_INLINE_ML_CODE && gate_cap == ZXC_SPL_INLINE_ML_CODE) return n_seq;
+
+    // 1. Mark the matches to split (under either cap) and drop their varints;
+    // the other extras move forward.
     size_t r = 0, w = 0;
     uint32_t extra = 0;
     for (uint32_t i = 0; i < n_seq; i++) {
         const uint8_t tok = tokens[i];
-        const int bad = ctx_bad[side[i]];
+        const int bad = gate_cap != ZXC_SPL_INLINE_ML_CODE && ctx_bad[side[i]];
         side[i] = 0;
         if ((tok >> ZXC_TOKEN_LIT_BITS) == ZXC_TOKEN_LL_MASK)
             zxc_varint_keep(extras, &w, &r, extras_end);
         if ((tok & ZXC_TOKEN_ML_MASK) != ZXC_TOKEN_ML_MASK) continue;
         const uint8_t* p = extras + r;
         const uint32_t code = zxc_read_varint(&p, extras_end) + ZXC_TOKEN_ML_MASK;
-        if (bad && code <= cap) {
+        if (code <= all_cap || (bad && code <= gate_cap)) {
             side[i] = (uint8_t)code;
-            extra += zxc_glo_split_pieces(code) - 1;
+            extra += zxc_spl_match_split_pieces(code) - 1;
             r = (size_t)(p - extras);
         } else {
             zxc_extras_move(extras, &w, &r, p);
@@ -418,10 +488,10 @@ static uint32_t zxc_glo_split_block(uint8_t* RESTRICT tokens, uint16_t* RESTRICT
         }
         uint32_t code = side[i];
         uint8_t ll_bits = tok & (uint8_t)(ZXC_TOKEN_LL_MASK << ZXC_TOKEN_LIT_BITS);
-        out -= zxc_glo_split_pieces(code);
+        out -= zxc_spl_match_split_pieces(code);
         uint32_t k = out;
-        while (code > ZXC_GLO_INLINE_ML_CODE) {
-            const uint32_t p = zxc_glo_split_piece(code);
+        while (code > ZXC_SPL_INLINE_ML_CODE) {
+            const uint32_t p = zxc_spl_match_split_piece(code);
             tokens[k] = (uint8_t)(ll_bits | p);
             offsets[k++] = off;
             ll_bits = 0;
@@ -867,7 +937,7 @@ static ZXC_ALWAYS_INLINE void zxc_opt_relax(uint32_t* RESTRICT dp, uint16_t* RES
  *
  * For each L in [L_start, L_end), if @p nxt is strictly less than the
  * current dp[p+L], rewrite dp/parent_len/parent_off in lockstep: same
- * semantics as the scalar update inside ::zxc_lz77_optimal_parse_glo.
+ * semantics as the scalar update inside ::zxc_lz77_optimal_parse_spl.
  * Caller guarantees @p nxt is independent of L (the cost of the L-th
  * transition does not vary across the requested span).
  *
@@ -1103,7 +1173,7 @@ static uint32_t zxc_opt_estimate_lit_bits(const uint8_t* RESTRICT src, const siz
  *                              to choose 1-byte vs 2-byte offset encoding).
  * @return @c ZXC_OK on success, or a negative @ref zxc_error_t.
  */
-static int zxc_lz77_optimal_parse_glo(zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRICT src,
+static int zxc_lz77_optimal_parse_spl(zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRICT src,
                                       const size_t src_sz, uint32_t* RESTRICT hash_table,
                                       uint8_t* RESTRICT hash_tags, uint16_t* RESTRICT chain_table,
                                       const uint32_t epoch_mark, const uint32_t offset_mask,
@@ -1320,7 +1390,7 @@ static int zxc_lz77_optimal_parse_glo(zxc_cctx_t* RESTRICT ctx, const uint8_t* R
             }
             const uint32_t ll = (uint32_t)LL;
             const uint32_t ml = L - ZXC_LZ_MIN_MATCH_LEN;
-            if (UNLIKELY(!zxc_glo_put_seq(buf_tokens, buf_offsets, buf_extras, &seq_c, &extras_sz,
+            if (UNLIKELY(!zxc_spl_put_seq(buf_tokens, buf_offsets, buf_extras, &seq_c, &extras_sz,
                                           &max_offset, ll, ml, off_biased)))
                 return ZXC_ERROR_OVERFLOW;
             lit_start = pos;
@@ -1392,10 +1462,10 @@ static void zxc_lz_seed_dict(const uint8_t* RESTRICT src, const size_t dict_size
 }
 
 /**
- * @brief Encodes one block in the GLO format (levels 3 and up).
+ * @brief Encodes one block in the SPL format (levels 3 and up).
  *
  * Two parsers feed the same serialiser. Levels 6 and 7 hand the whole parse to
- * zxc_lz77_optimal_parse_glo() and rejoin at @c parse_done; levels 3 to 5 run
+ * zxc_lz77_optimal_parse_spl() and rejoin at @c parse_done; levels 3 to 5 run
  * the lazy loop here, with the search depth, lazy attempts and hash step taken
  * from zxc_get_lz77_params(). Either way the parse yields a literal run plus
  * token, offset and extras streams.
@@ -1413,7 +1483,7 @@ static void zxc_lz_seed_dict(const uint8_t* RESTRICT src, const size_t dict_size
  * @return ZXC_OK, or a negative @ref zxc_error_t, typically
  *         @ref ZXC_ERROR_DST_TOO_SMALL.
  */
-static int zxc_encode_block_glo(zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRICT src,
+static int zxc_encode_block_spl(zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRICT src,
                                 const size_t src_sz, uint8_t* RESTRICT dst, size_t dst_cap,
                                 size_t* RESTRICT out_sz) {
     if (UNLIKELY(dst_cap < ZXC_BLOCK_HEADER_SIZE)) return ZXC_ERROR_DST_TOO_SMALL;
@@ -1461,7 +1531,7 @@ static int zxc_encode_block_glo(zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRIC
     // Level 6+: price-based optimal parser (fills outputs and skips the
     // lazy loop + last_lits handling below via `goto parse_done`).
     if (level >= ZXC_LEVEL_DENSITY) {
-        const int rc = zxc_lz77_optimal_parse_glo(
+        const int rc = zxc_lz77_optimal_parse_spl(
             ctx, src, src_sz, hash_table, hash_tags, chain_table, epoch_mark, offset_mask, level,
             literals, buf_tokens, buf_offsets, buf_extras, &seq_c, &lit_c, &extras_sz, &max_offset);
         if (UNLIKELY(rc != 0)) return rc;
@@ -1495,7 +1565,7 @@ static int zxc_encode_block_glo(zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRIC
 
             if (ll > 0) zxc_flush_literals(literals, &lit_c, anchor, ll, iend);
 
-            if (UNLIKELY(!zxc_glo_put_seq(buf_tokens, buf_offsets, buf_extras, &seq_c, &extras_sz,
+            if (UNLIKELY(!zxc_spl_put_seq(buf_tokens, buf_offsets, buf_extras, &seq_c, &extras_sz,
                                           &max_offset, ll, ml, off_biased)))
                 return ZXC_ERROR_OVERFLOW;
 
@@ -1528,9 +1598,10 @@ static int zxc_encode_block_glo(zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRIC
     }
 
 parse_done:;
-    // Per-block match splitting on the parsed block (see zxc_glo_split_block).
-    seq_c = zxc_glo_split_block(buf_tokens, buf_offsets, buf_extras, &extras_sz, ctx->buf_split,
-                                ctx->buf_split_hist, seq_c, lzp.split_max);
+    // Per-block match splitting on the parsed block (see zxc_spl_match_split_block).
+    seq_c = zxc_spl_match_split_block(
+        buf_tokens, buf_offsets, buf_extras, &extras_sz, ctx->buf_split, ctx->buf_split_hist, seq_c,
+        lit_c, (max_offset <= UINT8_MAX) ? 1U : 2U, lzp.split_max, ctx->split_budget_pct);
     // Dictionary-table trainer hook: accumulate the REAL post-LZ literal
     // frequencies (see zxc_train_dict_huf). Cold path, NULL outside training.
     if (UNLIKELY(ctx->lit_freq_acc)) {
@@ -1822,7 +1893,7 @@ parse_done:;
         }
     }
 
-    zxc_block_header_t bh = {.block_type = ZXC_BLOCK_GLO};
+    zxc_block_header_t bh = {.block_type = ZXC_BLOCK_SPL};
     uint8_t* const p = dst + ZXC_BLOCK_HEADER_SIZE;
     size_t rem = dst_cap - ZXC_BLOCK_HEADER_SIZE;
 
@@ -1844,7 +1915,7 @@ parse_done:;
     const size_t sz_off = off_stream_size;
     const size_t sz_ext = extras_sz;
 
-    const int ghs = zxc_write_glo_header_and_desc(p, rem, &gh, (uint32_t)sz_lit, (uint32_t)sz_tok);
+    const int ghs = zxc_write_spl_header_and_desc(p, rem, &gh, (uint32_t)sz_lit, (uint32_t)sz_tok);
     if (UNLIKELY(ghs < 0)) return ghs;
 
     uint8_t* p_curr = p + ghs;
@@ -1996,11 +2067,11 @@ parse_done:;
 }
 
 /**
- * @brief Encodes one block in the GHI format (levels 1 and 2, the speed path).
+ * @brief Encodes one block in the PAK format (levels 1 and 2, the speed path).
  *
- * What sets GHI apart is the sequence record. GLO packs a 1-byte token (4-bit
+ * What sets PAK apart is the sequence record. SPL packs a 1-byte token (4-bit
  * literal length, 4-bit match length) and escapes anything longer through a
- * varint; GHI spends a fixed 4 bytes instead - 8-bit LL, 8-bit ML (both
+ * varint; PAK spends a fixed 4 bytes instead - 8-bit LL, 8-bit ML (both
  * escaping at 255) and a 16-bit offset covering the whole 64 KB window. Lengths
  * between 16 and 255 are common, and this keeps them out of the varint reader,
  * which is what the decoder actually pays for.
@@ -2014,7 +2085,7 @@ parse_done:;
  * @return ZXC_OK, or a negative @ref zxc_error_t, typically
  *         @ref ZXC_ERROR_DST_TOO_SMALL.
  */
-static int zxc_encode_block_ghi(zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRICT src,
+static int zxc_encode_block_pak(zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRICT src,
                                 const size_t src_sz, uint8_t* RESTRICT dst, const size_t dst_cap,
                                 size_t* RESTRICT const out_sz) {
     if (UNLIKELY(dst_cap < ZXC_BLOCK_HEADER_SIZE)) return ZXC_ERROR_DST_TOO_SMALL;
@@ -2110,7 +2181,7 @@ static int zxc_encode_block_ghi(zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRIC
         lit_c += last_lits;
     }
 
-    zxc_block_header_t bh = {.block_type = ZXC_BLOCK_GHI};
+    zxc_block_header_t bh = {.block_type = ZXC_BLOCK_PAK};
     uint8_t* const p = dst + ZXC_BLOCK_HEADER_SIZE;
     size_t rem = dst_cap - ZXC_BLOCK_HEADER_SIZE;
 
@@ -2121,7 +2192,7 @@ static int zxc_encode_block_ghi(zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRIC
                                  .enc_mlen = 0,
                                  .enc_off = 0};
 
-    const int ghs = zxc_write_ghi_header(p, rem, &gh);
+    const int ghs = zxc_write_pak_header(p, rem, &gh);
     if (UNLIKELY(ghs < 0)) return ghs;
 
     uint8_t* p_curr = p + ghs;
@@ -2131,7 +2202,7 @@ static int zxc_encode_block_ghi(zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRIC
     const size_t sz_seq = seq_c * sizeof(uint32_t);
     const size_t sz_ext = extras_c;
 
-    // See the GLO twin. GHI literals are always RAW, so the slack always
+    // See the SPL twin. PAK literals are always RAW, so the slack always
     // matters here.
     const size_t behind_lit = sz_seq + sz_ext;
     const size_t pad = (behind_lit < ZXC_BLOCK_LIT_SLACK) ? ZXC_BLOCK_LIT_SLACK - behind_lit : 0;
@@ -2207,7 +2278,7 @@ static int zxc_encode_block_raw(const uint8_t* RESTRICT src, const size_t src_sz
 /**
  * @brief Compresses one chunk into a single ZXC block (the compression hot path).
  *
- * Selects the GHI encoder at level <= 2, otherwise GLO; falls back to a RAW
+ * Selects the PAK encoder at level <= 2, otherwise SPL; falls back to a RAW
  * block when the coded form would not shrink the data. When @c ctx->dict_size
  * is > 0, @p chunk is the [dict | block] concat and only the block tail counts
  * toward the expansion check. Appends the checksum when enabled, seeded with
@@ -2226,9 +2297,9 @@ int zxc_compress_chunk_wrapper(zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRICT
     int res = ZXC_OK;
 
     if (ctx->compression_level <= 2)
-        res = zxc_encode_block_ghi(ctx, chunk, src_sz, dst, dst_cap, &w);
+        res = zxc_encode_block_pak(ctx, chunk, src_sz, dst, dst_cap, &w);
     else
-        res = zxc_encode_block_glo(ctx, chunk, src_sz, dst, dst_cap, &w);
+        res = zxc_encode_block_spl(ctx, chunk, src_sz, dst, dst_cap, &w);
 
     // Check expansion against block data size (excluding dict prefix).
     if (UNLIKELY(res != ZXC_OK || w >= block_sz)) {
