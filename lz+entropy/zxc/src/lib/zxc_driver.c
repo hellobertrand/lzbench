@@ -1223,8 +1223,9 @@ static int zxc_file_span(FILE* f, long long* saved, uint64_t* size) {
  * level, block size, checksums, seekable, dictionary) with their defaults, then
  * runs the engine over the input.
  */
-int64_t zxc_stream_compress(FILE* f_in, FILE* f_out, const zxc_compress_opts_t* opts) {
+int64_t zxc_stream_compress(FILE* f_in, FILE* f_out, const zxc_cctx* cfg) {
     if (UNLIKELY(!f_in)) return ZXC_ERROR_NULL_INPUT;
+    const zxc_cparams_t* const opts = cfg ? zxc_cctx_params(cfg) : NULL;
 
     const int n_threads = opts ? opts->n_threads : 0;
     const int checksum_enabled = opts ? opts->checksum_enabled : 0;
@@ -1280,7 +1281,7 @@ int64_t zxc_stream_compress(FILE* f_in, FILE* f_out, const zxc_compress_opts_t* 
     if (f_out) {
         uint8_t h[ZXC_FILE_HEADER_SIZE];
         zxc_write_file_header(h, ZXC_FILE_HEADER_SIZE, block_size, checksum_enabled,
-                              zxc_dict_id(dict, dict_size, dict_huf), seekable);
+                              zxc_dict_compute_id(dict, dict_size, dict_huf), seekable);
         if (UNLIKELY(fwrite(h, 1, ZXC_FILE_HEADER_SIZE, f_out) != ZXC_FILE_HEADER_SIZE))
             ctx->io_error = 1;
     }
@@ -1308,8 +1309,9 @@ int64_t zxc_stream_compress(FILE* f_in, FILE* f_out, const zxc_compress_opts_t* 
  * header, not from @p opts. Consecutive frames with the same block size and
  * checksum flag share one engine.
  */
-int64_t zxc_stream_decompress(FILE* f_in, FILE* f_out, const zxc_decompress_opts_t* opts) {
+int64_t zxc_stream_decompress(FILE* f_in, FILE* f_out, const zxc_dctx* cfg) {
     if (UNLIKELY(!f_in)) return ZXC_ERROR_NULL_INPUT;
+    const zxc_dparams_t* const opts = cfg ? zxc_dctx_params(cfg) : NULL;
 
     const int n_threads = opts ? opts->n_threads : 0;
     const int checksum_enabled = opts ? opts->checksum_enabled : 0;
@@ -1317,7 +1319,7 @@ int64_t zxc_stream_decompress(FILE* f_in, FILE* f_out, const zxc_decompress_opts
     const size_t dict_size = ZXC_OPTS_DICT_SIZE(opts);
     const uint8_t* dict_huf = ZXC_OPTS_DICT_HUF(opts);
     if (UNLIKELY(dict_size > ZXC_DICT_SIZE_MAX)) return ZXC_ERROR_DICT_TOO_LARGE;
-    const uint32_t dict_id = zxc_dict_id(dict, dict_size, dict_huf);
+    const uint32_t dict_id = zxc_dict_compute_id(dict, dict_size, dict_huf);
 
     zxc_stream_engine_t e;
     int running = 0;
