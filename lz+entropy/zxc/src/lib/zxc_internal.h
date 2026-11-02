@@ -352,9 +352,19 @@ static inline int zxc_magic_prefix_ok(const uint8_t* p, const size_t n) {
  * guarantees the fast path is reachable and that tail bounds checks
  * never spuriously reject the last literals of a valid block.
  *
+ * Sized by the PAK 4x loop, whose entry check runs once per batch: four
+ * sequences of inline (pre-varint) output, plus the wild-copy overshoot.
+ * Memory safety rests on this bound (static_assert below); SPL needs less.
+ *
  * @see zxc_decompress_block_bound()
  */
-#define ZXC_DECOMPRESS_TAIL_PAD (ZXC_PAD_SIZE * 66)
+#define ZXC_DECOMPRESS_TAIL_PAD (4 * ZXC_PAK_MAX_INLINE_OUT_PER_SEQ + ZXC_PAD_SIZE) /* 2084 */
+/**
+ * @brief Output per multi-threaded decode job: smaller blocks travel several to
+ *        a job, paying the thread handoff once. Used by the FILE* engine
+ *        (regular files only) and the seekable range reader.
+ */
+#define ZXC_MT_BATCH_BYTES ((size_t)256 * 1024)
 /** @brief Assumed CPU cache line size for alignment. */
 #define ZXC_CACHE_LINE_SIZE 64
 /** @brief Bitmask for cache-line alignment checks. */
@@ -378,10 +388,12 @@ static_assert((ZXC_CACHE_LINE_SIZE & ZXC_ALIGNMENT_MASK) == 0,
 /** @brief Bit flag in the Flags byte: a SEK block sits between the EOF block and the footer
  *  (bit 5). */
 #define ZXC_FILE_FLAG_HAS_SEEK_TABLE 0x20U
+/** @brief Reserved bit in the Flags byte (bit 4), must be 0. */
+#define ZXC_FILE_FLAG_RESERVED 0x10U
 /** @brief Mask for the checksum algorithm id (bits 0-3). */
 #define ZXC_FILE_CHECKSUM_ALGO_MASK 0x0FU
 static_assert(((ZXC_FILE_FLAG_HAS_CHECKSUM | ZXC_FILE_FLAG_HAS_DICTIONARY |
-                ZXC_FILE_FLAG_HAS_SEEK_TABLE) &
+                ZXC_FILE_FLAG_HAS_SEEK_TABLE | ZXC_FILE_FLAG_RESERVED) &
                ZXC_FILE_CHECKSUM_ALGO_MASK) == 0,
               "a file flag overlaps the checksum algorithm id");
 
@@ -394,6 +406,8 @@ static_assert(((ZXC_FILE_FLAG_HAS_CHECKSUM | ZXC_FILE_FLAG_HAS_DICTIONARY |
 /** @brief K-gram length scanned by the dictionary trainer. Aligned on the LZ
  *         minimum match length so trained patterns are matchable at encode time. */
 #define ZXC_DICT_KGRAM_LEN ZXC_LZ_MIN_MATCH_LEN
+/** @brief Longest trainer segment: one repetitive region cannot take the whole budget. */
+#define ZXC_DICT_SEGMENT_MAX 4096
 /** @brief Address bits for the dictionary trainer's k-gram frequency table. */
 #define ZXC_DICT_HASH_BITS 16
 /** @brief Maximum number of candidate segments the dictionary trainer keeps. */
@@ -516,6 +530,10 @@ static_assert(ZXC_TOKEN_LIT_BITS == 4 && ZXC_TOKEN_ML_BITS == 4,
 #define ZXC_SEQ_ML_MASK ((1U << ZXC_SEQ_ML_BITS) - 1)
 /** @brief Mask to extract Offset from a PAK sequence. */
 #define ZXC_SEQ_OFF_MASK ((1U << ZXC_SEQ_OFF_BITS) - 1)
+/** @brief Shift of the Literal Length field: the top byte of the word. */
+#define ZXC_SEQ_LL_SHIFT (ZXC_SEQ_ML_BITS + ZXC_SEQ_OFF_BITS)
+/** @brief Shift of the Match Length field: just above the offset. */
+#define ZXC_SEQ_ML_SHIFT ZXC_SEQ_OFF_BITS
 static_assert(ZXC_SEQ_LL_BITS + ZXC_SEQ_ML_BITS + ZXC_SEQ_OFF_BITS == 32,
               "a PAK sequence is one 32-bit word");
 /** @} */
@@ -526,6 +544,12 @@ static_assert(ZXC_SEQ_LL_BITS + ZXC_SEQ_ML_BITS + ZXC_SEQ_OFF_BITS == 32,
 #define ZXC_LIT_RLE_FLAG 0x80U
 /** @brief Mask to extract the run/literal length (lower 7 bits). */
 #define ZXC_LIT_LEN_MASK (ZXC_LIT_RLE_FLAG - 1)
+/** @brief Longest literal run one token carries: a length field of 0 means 1 byte. */
+#define ZXC_LIT_RUN_MAX (ZXC_LIT_LEN_MASK + 1U) /* 128 */
+/** @brief Shortest run worth an RLE token: a length field of 0 means this many bytes. */
+#define ZXC_LIT_RLE_RUN_MIN 4U
+/** @brief Longest run one RLE token carries. */
+#define ZXC_LIT_RLE_RUN_MAX (ZXC_LIT_LEN_MASK + ZXC_LIT_RLE_RUN_MIN) /* 131 */
 /** @} */
 
 /** @name LZ77 Constants
@@ -558,7 +582,13 @@ static_assert(ZXC_SEQ_LL_BITS + ZXC_SEQ_ML_BITS + ZXC_SEQ_OFF_BITS == 32,
  * the encoder refuses to emit values above this bound. Together they bound the
  * varint surface to exactly the format-defined block size limit. */
 #define ZXC_MAX_VARINT_VALUE ((uint32_t)(ZXC_BLOCK_SIZE_MAX - 1U))
-static_assert(ZXC_MAX_VARINT_VALUE < (1U << 21), "varint values must fit the 3-byte form");
+/** @name Varint reach: the first value each encoded length cannot hold (7, 14, 21 bits).
+ *  @{ */
+#define ZXC_VARINT_1B_LIMIT (1U << 7)
+#define ZXC_VARINT_2B_LIMIT (1U << 14)
+#define ZXC_VARINT_3B_LIMIT (1U << 21)
+/** @} */
+static_assert(ZXC_MAX_VARINT_VALUE < ZXC_VARINT_3B_LIMIT, "varint values must fit the 3-byte form");
 static_assert(ZXC_BLOCK_SIZE_MIN <= ZXC_BLOCK_SIZE_DEFAULT &&
                   ZXC_BLOCK_SIZE_DEFAULT <= ZXC_BLOCK_SIZE_MAX &&
                   (ZXC_BLOCK_SIZE_DEFAULT & (ZXC_BLOCK_SIZE_DEFAULT - 1)) == 0,
@@ -646,8 +676,10 @@ static ZXC_ALWAYS_INLINE uint32_t zxc_read_varint(const uint8_t** ptr, const uin
 static_assert(ZXC_SPL_MAX_INLINE_ML <= ZXC_PAD_SIZE, "an inline SPL match is one 32-byte store");
 static_assert(ZXC_LZ_WINDOW_SIZE - ZXC_LZ_OFFSET_BIAS <= ZXC_SEQ_OFF_MASK,
               "a biased offset must fit the 16-bit wire field");
-static_assert(4 * ZXC_PAK_MAX_INLINE_OUT_PER_SEQ + ZXC_PAD_SIZE <= ZXC_DECOMPRESS_TAIL_PAD,
-              "ZXC_DECOMPRESS_TAIL_PAD must hold a 4x PAK batch and its wild-copy overshoot");
+static_assert(ZXC_DECOMPRESS_TAIL_PAD == 2084,
+              "ZXC_DECOMPRESS_TAIL_PAD feeds the public bounds: change it on purpose only");
+static_assert(4 * ZXC_SPL_MAX_INLINE_OUT_PER_SEQ + ZXC_PAD_SIZE + 4 <= ZXC_DECOMPRESS_TAIL_PAD,
+              "ZXC_DECOMPRESS_TAIL_PAD must also hold the SPL 4x loop margin");
 static_assert(ZXC_DICT_SIZE_MAX <= ZXC_LZ_MAX_DIST, "a dictionary must stay within offset reach");
 
 /** @brief Match distance floor the encoder holds to at levels 1 to 5, sized to
@@ -690,13 +722,16 @@ static_assert(ZXC_DICT_SIZE_MAX <= ZXC_LZ_MAX_DIST, "a dictionary must stay with
 /** @brief Threshold above which `find_best_match` is skipped at intra-match
  *         positions, keeping the parser O(N) on highly repetitive data. */
 #define ZXC_OPT_LONG_MATCH_SKIP ((size_t)256)
-static_assert(ZXC_OPT_LONG_MATCH_SKIP <= ZXC_LZ_MIN_MATCH_LEN + ZXC_TOKEN_ML_MASK + 128 * 128,
+static_assert(ZXC_OPT_LONG_MATCH_SKIP <=
+                  ZXC_LZ_MIN_MATCH_LEN + ZXC_TOKEN_ML_MASK + ZXC_VARINT_2B_LIMIT,
               "covered positions relax only the first two match cost classes");
 /** @brief Minimum literal count for the sample-based Huffman cost estimator
  *         used by the optimal parser. Below this, the strided sample is too
  *         small for the resulting code-lengths to be statistically reliable,
  *         so the estimator falls back to RAW cost (8 bits/byte). */
 #define ZXC_OPT_LIT_SAMPLE_MIN 1024
+/** @brief Bytes that estimator samples per block: enough for a 256-symbol histogram. */
+#define ZXC_OPT_LIT_SAMPLE_TARGET 4096
 
 /** @} */
 
@@ -911,16 +946,6 @@ static inline int zxc_ss_prem_huf_q8(const int level) {
 #define ZXC_HUF_MIN_LITERALS 139
 /** @} */
 
-/** @brief Clamps a resolved compression level to 1..7.
- *
- *         Never rejected, at every compress entry point and so in every
- *         binding: 99 behaves as ULTRA, -5 as FASTEST. Level 0 resolves to
- *         the caller's default first. */
-static inline int zxc_level_clamp(const int level) {
-    if (level < ZXC_LEVEL_FASTEST) return ZXC_LEVEL_FASTEST;
-    return (level > ZXC_LEVEL_ULTRA) ? ZXC_LEVEL_ULTRA : level;
-}
-
 /**
  * @brief Compression parameters of a @ref zxc_cctx, the private form of what
  *        zxc_cctx_set_param() / zxc_cctx_set_dict() / zxc_cctx_set_progress()
@@ -959,8 +984,8 @@ typedef struct {
 /** @brief Shared literal Huffman table, gated on @c dict the same way. */
 #define ZXC_OPTS_DICT_HUF(o) \
     (((o) && (o)->dict && (o)->dict_size > 0) ? (const uint8_t*)(o)->dict_huf : NULL)
-/** @brief Compression level, 0 meaning the default, clamped to 1..7. */
-#define ZXC_OPTS_LEVEL(o, dflt) zxc_level_clamp(((o) && (o)->level != 0) ? (o)->level : (dflt))
+/** @brief Compression level, 0 meaning the default. */
+#define ZXC_OPTS_LEVEL(o, dflt) (((o) && (o)->level != 0) ? (o)->level : (dflt))
 /** @brief Block size, 0 meaning the default. */
 #define ZXC_OPTS_BLOCK_SIZE(o, dflt) (((o) && (o)->block_size > 0) ? (o)->block_size : (dflt))
 /** @name Per-block match splitting (zxc_spl_match_split_block), a level-table policy
@@ -2314,8 +2339,9 @@ int zxc_write_block_header(uint8_t* RESTRICT dst, const size_t dst_capacity,
  * @param[in]  src_size  Size of @p src in bytes.
  * @param[out] bh        Block header structure populated with the parsed data.
  *
- * @return @c ZXC_OK on success, or @c ZXC_ERROR_SRC_TOO_SMALL if @p src is
- *         smaller than @c ZXC_BLOCK_HEADER_SIZE.
+ * @return @c ZXC_OK on success, @c ZXC_ERROR_SRC_TOO_SMALL if @p src is
+ *         smaller than @c ZXC_BLOCK_HEADER_SIZE, or @c ZXC_ERROR_BAD_HEADER on a
+ *         bad checksum or non-zero Block Flags / Reserved.
  */
 int zxc_read_block_header(const uint8_t* RESTRICT src, const size_t src_size,
                           zxc_block_header_t* bh);

@@ -57,9 +57,10 @@ typedef enum {
     /** Block size in bytes, a power of two in [@ref ZXC_BLOCK_SIZE_MIN,
      *  @ref ZXC_BLOCK_SIZE_MAX]; default @ref ZXC_BLOCK_SIZE_DEFAULT. */
     ZXC_C_BLOCK_SIZE = 2,
-    /** Worker threads for the @c FILE* pipeline, at most @ref ZXC_MAX_THREADS;
-     *  default 0, auto-detect. The buffer, block and push APIs are
-     *  single-threaded and ignore it. */
+    /** Workers of the @c FILE* pipeline, at most @ref ZXC_MAX_THREADS; the
+     *  reader and writer come on top. 0 (default): online processors, capped
+     *  at @ref ZXC_MAX_THREADS, minus one; at least one, at most 511. The
+     *  buffer, block and push APIs are single-threaded and ignore it. */
     ZXC_C_THREADS = 3,
     /** 1 appends the block checksums and the archive digest; default 0. */
     ZXC_C_CHECKSUM = 4,
@@ -70,13 +71,15 @@ typedef enum {
 /**
  * @brief Decompression parameters, set on a @c zxc_dctx with zxc_dctx_set_param().
  *
- * Same rules as @ref zxc_cparam_t: 0 restores the default, other values must
- * sit within zxc_dparam_bounds(). The dictionary and the progress callback
+ * Same rules as @ref zxc_cparam_t, so 0 restores the default and other values
+ * must sit within zxc_dparam_bounds(). The dictionary and the progress callback
  * go through zxc_dctx_set_dict() and zxc_dctx_set_progress().
  */
 typedef enum {
-    /** Worker threads for the @c FILE* pipeline, at most @ref ZXC_MAX_THREADS;
-     *  default 0, auto-detect. */
+    /** Workers of the @c FILE* pipeline, at most @ref ZXC_MAX_THREADS; the
+     *  reader and writer come on top. 0 (default): online processors, capped
+     *  at @ref ZXC_MAX_THREADS, minus one unless the workers read a regular
+     *  file themselves; at least one, at most 511 or 512. */
     ZXC_D_THREADS = 1,
     /** 1 verifies the block checksums and the archive digest when the archive
      *  carries them; default 0, no verification. */

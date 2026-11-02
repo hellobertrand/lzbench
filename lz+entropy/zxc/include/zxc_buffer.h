@@ -92,6 +92,12 @@ ZXC_EXPORT const char* zxc_version_string(void);
  */
 ZXC_EXPORT unsigned zxc_version_number(void);
 
+/**
+ * @brief Release code name of the loaded library, @ref ZXC_VERSION_CODENAME.
+ * @return Null-terminated compile-time constant; do not free.
+ */
+ZXC_EXPORT const char* zxc_version_codename(void);
+
 /** @} */ /* end of library_info */
 
 /**
@@ -126,13 +132,13 @@ ZXC_EXPORT size_t zxc_compress_bound(const size_t input_size);
  * @param[out] dst          Destination buffer.
  * @param[in]  dst_capacity Capacity of @p dst.
  * @param[in]  level        Compression level, 1 to 7 (@ref zxc_compression_level_t);
- *                          0 selects @ref ZXC_LEVEL_DEFAULT, others are
- *                          silently clamped.
+ *                          0 selects @ref ZXC_LEVEL_DEFAULT.
  *
  * @note @p src and @p dst must not overlap (same contract as memcpy).
  *
- * @return Bytes written to @p dst (> 0), or a negative @ref zxc_error_t
- *         (e.g. @ref ZXC_ERROR_DST_TOO_SMALL).
+ * @return Bytes written to @p dst (> 0), or a negative @ref zxc_error_t code:
+ *         @ref ZXC_ERROR_BAD_LEVEL for any other @p level,
+ *         @ref ZXC_ERROR_DST_TOO_SMALL, ...
  */
 ZXC_EXPORT int64_t zxc_compress(const void* src, const size_t src_size, void* dst,
                                 const size_t dst_capacity, int level);
@@ -396,13 +402,9 @@ ZXC_EXPORT size_t zxc_decompress_block_bound(const size_t uncompressed_size);
  *
  * @note @p src and @p dst must not overlap (same contract as memcpy).
  *
- * @return Compressed block size (> 0), or a negative @ref zxc_error_t.
+ * @return Compressed block size (> 0), or a negative @ref zxc_error_t;
  *         @ref ZXC_ERROR_BAD_BLOCK_SIZE if @p src_size exceeds
- *         @ref ZXC_BLOCK_SIZE_MAX or @c block_size is not a power of two in
- *         range; @ref ZXC_ERROR_BAD_LEVEL on a static
- *         context for a level raise its workspace cannot accommodate (levels
- *         above @ref ZXC_LEVEL_ULTRA are otherwise silently clamped);
- *         @ref ZXC_ERROR_DICT_UNSUPPORTED on a static context with a dictionary.
+ *         @ref ZXC_BLOCK_SIZE_MAX, or on a static context its pinned block size.
  */
 ZXC_EXPORT int64_t zxc_compress_block(zxc_cctx* cctx, const void* src, size_t src_size, void* dst,
                                       size_t dst_capacity);
@@ -560,10 +562,10 @@ ZXC_EXPORT int zxc_cctx_get_param(const zxc_cctx* cctx, zxc_cparam_t param, int6
 /**
  * @brief Attaches a pre-trained dictionary to @p cctx; a NULL @p dict detaches.
  *
- * The context keeps the pointers only: the bytes stay caller-owned and must
- * outlive every call that uses them. @p dict_huf, when non-NULL, is the
- * @ref ZXC_HUF_TABLE_SIZE-byte shared literal table (zxc_dict_huf()), used at
- * levels 6-7 and part of the archive's dict_id binding.
+ * The context keeps its own copy of @p dict and @p dict_huf: the caller's
+ * buffers are free once this returns. @p dict_huf, when non-NULL, is the
+ * shared literal table of @ref ZXC_HUF_TABLE_SIZE bytes (zxc_dict_huf()), used
+ * at levels 6-7 and part of the archive's dict_id binding.
  *
  * @param[in,out] cctx      Context to configure.
  * @param[in]     dict      Dictionary content, or NULL for none.
@@ -571,7 +573,8 @@ ZXC_EXPORT int zxc_cctx_get_param(const zxc_cctx* cctx, zxc_cparam_t param, int6
  * @param[in]     dict_huf  Shared literal table, or NULL.
  * @return @ref ZXC_OK; @ref ZXC_ERROR_DICT_TOO_LARGE above the maximum;
  *         @ref ZXC_ERROR_DICT_UNSUPPORTED on a static context, which has no
- *         room for the dictionary prefix.
+ *         room for the dictionary prefix; @ref ZXC_ERROR_MEMORY when the copy
+ *         cannot be allocated. A refused call leaves the attached dictionary.
  */
 ZXC_EXPORT int zxc_cctx_set_dict(zxc_cctx* cctx, const void* dict, size_t dict_size,
                                  const void* dict_huf);
@@ -670,7 +673,7 @@ ZXC_EXPORT int zxc_dctx_get_param(const zxc_dctx* dctx, zxc_dparam_t param, int6
 /**
  * @brief Attaches the dictionary the archives were compressed with; NULL detaches.
  *
- * Same ownership rules as zxc_cctx_set_dict(). @p dict_huf must be the table
+ * Copies the bytes, as zxc_cctx_set_dict() does. @p dict_huf must be the table
  * used at compression time when the archive carries one; the header's dict_id
  * is checked against the pair, @ref ZXC_ERROR_DICT_MISMATCH otherwise.
  *
@@ -679,7 +682,8 @@ ZXC_EXPORT int zxc_dctx_get_param(const zxc_dctx* dctx, zxc_dparam_t param, int6
  * @param[in]     dict_size Size of @p dict in bytes, at most @ref ZXC_DICT_SIZE_MAX.
  * @param[in]     dict_huf  Shared literal table, or NULL.
  * @return @ref ZXC_OK; @ref ZXC_ERROR_DICT_TOO_LARGE above the maximum;
- *         @ref ZXC_ERROR_DICT_UNSUPPORTED on a static context.
+ *         @ref ZXC_ERROR_DICT_UNSUPPORTED on a static context;
+ *         @ref ZXC_ERROR_MEMORY when the copy cannot be allocated.
  */
 ZXC_EXPORT int zxc_dctx_set_dict(zxc_dctx* dctx, const void* dict, size_t dict_size,
                                  const void* dict_huf);
@@ -824,7 +828,7 @@ ZXC_EXPORT size_t zxc_static_cctx_workspace_size(const size_t block_size, const 
  * The workspace is carved for @p block_size and @p level, so
  * zxc_cctx_set_param() refuses another @ref ZXC_C_BLOCK_SIZE
  * (@ref ZXC_ERROR_BAD_BLOCK_SIZE) and a raise into @ref ZXC_LEVEL_DENSITY
- * when @p level was below it (@ref ZXC_ERROR_BAD_LEVEL: the optimal-parser
+ * when @p level was below it (@ref ZXC_ERROR_BAD_LEVEL, as the optimal-parser
  * scratch is absent). Lower levels, checksum and seek table are honoured
  * without re-partitioning. Dictionaries are rejected by zxc_cctx_set_dict():
  * @ref ZXC_ERROR_DICT_UNSUPPORTED.
