@@ -247,9 +247,9 @@ static zxc_cpu_feature_t zxc_detect_cpu_features(void) {
             const int bmi2 = (regs[1] >> 8) & 1;  // CPUID.7.0:EBX[8]
             if (regs[1] & (1U << 5)) avx2 = 1;
             // AVX512 also needs XCR0[5..7] (opmask/ZMM)
-            if ((regs[1] & (1U << 16)) && (regs[1] & (1U << 30)) && (regs[2] & (1U << 1)) &&
-                (regs[2] & (1U << 6)) && (xcr0 & 0xE0) == 0xE0)
-                avx512 = 1; /* AVX512 tier = F+BW+VBMI+VBMI2, as the variant is built */
+            if ((regs[1] & (1U << 16)) && (regs[1] & (1U << 30)) && (regs[1] & (1U << 31)) &&
+                (regs[2] & (1U << 1)) && (regs[2] & (1U << 6)) && (xcr0 & 0xE0) == 0xE0)
+                avx512 = 1; /* AVX512 tier = F+BW+VL+VBMI+VBMI2, as the variant is built */
             // The AVX2/AVX512 variants are compiled with BMI1/BMI2/LZCNT enabled,
             // so both gates must prove those bits too. LZCNT (ABM) lives in
             // CPUID.80000001H:ECX[5]; that leaf is architectural on x86-64.
@@ -566,9 +566,9 @@ int zxc_huf_unpack_lengths(const uint8_t* RESTRICT in, uint8_t* RESTRICT code_le
  */
 static int64_t zxc_write_empty_frame(uint8_t* RESTRICT dst, const size_t dst_capacity,
                                      const size_t block_size, const int checksum_enabled,
-                                     const uint32_t did, const int seekable) {
-    const int h =
-        zxc_write_file_header(dst, dst_capacity, block_size, checksum_enabled, did, seekable);
+                                     const int has_dict, const uint32_t did, const int seekable) {
+    const int h = zxc_write_file_header(dst, dst_capacity, block_size, checksum_enabled, has_dict,
+                                        did, seekable);
     if (UNLIKELY(h < 0)) return h;
     size_t off = (size_t)h;
 
@@ -866,6 +866,21 @@ uint32_t zxc_get_dict_id(const void* src, const size_t src_size) {
 }
 
 /**
+ * @brief Tells whether an archive requires a dictionary, from its header.
+ *
+ * Public API; see @c zxc_buffer.h.
+ */
+// cppcheck-suppress unusedFunction
+int zxc_requires_dict(const void* src, const size_t src_size) {
+    if (UNLIKELY(!src)) return ZXC_ERROR_NULL_INPUT;
+    size_t chunk = 0;  // asked for so the block size code is checked too
+    int has_dict = 0;
+    const int rc =
+        zxc_read_file_header((const uint8_t*)src, src_size, &chunk, NULL, &has_dict, NULL, NULL);
+    return rc != ZXC_OK ? rc : has_dict;
+}
+
+/**
  * @brief Reads a frame's header and footer, without decoding.
  *
  * Public API; see @c zxc_buffer.h.
@@ -892,7 +907,7 @@ int zxc_get_last_frame_info(const void* src, const size_t src_size, zxc_frame_in
     const zxc_scan_src_t scan = zxc_scan_src_mem((const uint8_t*)src, src_size);
     zxc_frame_info_t got;
     uint64_t start = 0;
-    const int rc = zxc_scan_frame(&scan, src_size, &start, &got, NULL);
+    const int rc = zxc_scan_frame(&scan, src_size, &start, &got, NULL, NULL);
     if (rc == ZXC_OK) zxc_frame_info_copy(info, info_size, &got);
     return rc;
 }
@@ -1192,13 +1207,13 @@ static int64_t zxc_compress_cctx_resolved(zxc_cctx* cctx, const void* RESTRICT s
     // The encoder sees [dict | block], so the carved chunk covers both.
     const size_t eff_chunk =
         dict_size > 0 ? zxc_block_size_ceil(dict_size + o.block_size) : o.block_size;
-    const uint32_t did =
-        (dict && dict_size > 0) ? zxc_dict_compute_id(dict, dict_size, dict_huf) : 0;
+    const int has_dict = dict && dict_size > 0;
+    const uint32_t did = has_dict ? zxc_dict_compute_id(dict, dict_size, dict_huf) : 0;
 
     // Empty source: same writer as the one-shot, workspace left alone.
     if (UNLIKELY(src_size == 0))
-        return zxc_write_empty_frame((uint8_t*)dst, dst_capacity, o.block_size, o.checksum, did,
-                                     o.seekable);
+        return zxc_write_empty_frame((uint8_t*)dst, dst_capacity, o.block_size, o.checksum,
+                                     has_dict, did, o.seekable);
 
     // Re-init when the chunk changed, a level raise needs the optimal-parser
     // scratch, or a dictionary arrives on a context carved without its prefix.
@@ -1238,8 +1253,8 @@ static int64_t zxc_compress_cctx_resolved(zxc_cctx* cctx, const void* RESTRICT s
     const uint8_t* const op_end = op + dst_capacity;
     const uint8_t* const ip = (const uint8_t*)src;
 
-    const int h_val =
-        zxc_write_file_header(op, (size_t)(op_end - op), o.block_size, o.checksum, did, o.seekable);
+    const int h_val = zxc_write_file_header(op, (size_t)(op_end - op), o.block_size, o.checksum,
+                                            has_dict, did, o.seekable);
     if (UNLIKELY(h_val < 0)) return h_val;  // LCOV_EXCL_LINE
     op += h_val;
 
@@ -1546,10 +1561,11 @@ static int64_t zxc_dctx_decode_frame(zxc_dctx* dctx, const uint8_t* src, const s
     size_t runtime_chunk_size = 0;
     int file_has_checksums = 0;
     int file_has_seek = 0;
+    int header_has_dict = 0;
     uint32_t header_dict_id = 0;
 
     const int hrc = zxc_read_file_header(ip, src_size, &runtime_chunk_size, &file_has_checksums,
-                                         &header_dict_id, &file_has_seek);
+                                         &header_has_dict, &header_dict_id, &file_has_seek);
     if (UNLIKELY(hrc != ZXC_OK)) return hrc;
 
     // Static dctx: block_size is locked at workspace init; reject any
@@ -1557,11 +1573,11 @@ static int64_t zxc_dctx_decode_frame(zxc_dctx* dctx, const uint8_t* src, const s
     if (UNLIKELY(dctx->owns_workspace && runtime_chunk_size != dctx->last_block_size))
         return ZXC_ERROR_BAD_BLOCK_SIZE;
     // Static dctx: no room for a dictionary prefix.
-    if (UNLIKELY(dctx->owns_workspace && (header_dict_id != 0 || dict_size != 0)))
+    if (UNLIKELY(dctx->owns_workspace && (header_has_dict || dict_size != 0)))
         return ZXC_ERROR_DICT_UNSUPPORTED;
 
     // Dictionary binding: same contract as zxc_decompress().
-    if (header_dict_id != 0) {
+    if (header_has_dict) {
         if (UNLIKELY(!dict || dict_size == 0)) return ZXC_ERROR_DICT_REQUIRED;
         if (UNLIKELY(zxc_dict_compute_id(dict, dict_size, dict_huf) != header_dict_id))
             return ZXC_ERROR_DICT_MISMATCH;
@@ -1638,8 +1654,8 @@ static int64_t zxc_dctx_decode_frame(zxc_dctx* dctx, const uint8_t* src, const s
         }
 
         // The block's room: the rest of dst, in place cut at the unread input. The
-        // fast decoder never writes past its capacity; a block that does not fit
-        // decodes aside and copies only its real output.
+        // fast decoder needs a whole block plus its margin there; short of that, the
+        // strict decoder writes straight to dst, which spares the copy.
         const size_t rem_cap = (size_t)(op_end - op);
         size_t room = rem_cap;
         if (inplace) {
@@ -1656,9 +1672,17 @@ static int64_t zxc_dctx_decode_frame(zxc_dctx* dctx, const uint8_t* src, const s
         } else if (LIKELY(room >= work_sz)) {
             res = zxc_decompress_chunk_wrapper(ctx, ip, rem_src, op, work_sz, block_index);
         } else {
-            res = zxc_decompress_chunk_wrapper(ctx, ip, rem_src, ctx->work_buf, ctx->work_buf_cap,
-                                               block_index);
-            bounce = ctx->work_buf;
+            res = ZXC_ERROR_OVERFLOW;
+            if (!inplace && room)
+                res = zxc_decompress_chunk_wrapper_safe_public(ctx, ip, rem_src, op, room,
+                                                               block_index);
+            // Any failure is settled aside: it keeps the bounce path's verdict, and
+            // this is the path that tells a short dst from a corrupt block.
+            if (UNLIKELY(res < 0)) {
+                res = zxc_decompress_chunk_wrapper(ctx, ip, rem_src, ctx->work_buf,
+                                                   ctx->work_buf_cap, block_index);
+                bounce = ctx->work_buf;
+            }
         }
         if (bounce && LIKELY(res > 0)) {
             // A no-destination probe lands here too. In place, output past the
