@@ -27,7 +27,7 @@ ZXC_FLAGS = -I$(SRC)$(ZXC_DIR)/vendors $(ZXC_ISA_FLAGS)
 
 $(ZXC_DIR)/%_default.o: ZXC_ISA_FLAGS := -DZXC_FUNCTION_SUFFIX=_default
 $(ZXC_DIR)/%_avx2.o:    ZXC_ISA_FLAGS := -mavx2 -mbmi -mbmi2 -mlzcnt -mno-avx512f -DZXC_FUNCTION_SUFFIX=_avx2 -DZXC_USE_AVX2
-$(ZXC_DIR)/%_avx512.o:  ZXC_ISA_FLAGS := -mavx512f -mavx512bw -mavx512vbmi -mavx512vbmi2 -mbmi -mbmi2 -mlzcnt -DZXC_FUNCTION_SUFFIX=_avx512 -DZXC_USE_AVX512
+$(ZXC_DIR)/%_avx512.o:  ZXC_ISA_FLAGS := -mavx512f -mavx512bw -mavx512vl -mavx512vbmi -mavx512vbmi2 -mbmi -mbmi2 -mlzcnt -DZXC_FUNCTION_SUFFIX=_avx512 -DZXC_USE_AVX512
 $(ZXC_DIR)/%_neon32.o:  ZXC_ISA_FLAGS  = $(ZXC_NEON_FLAGS) -DZXC_FUNCTION_SUFFIX=_neon32
 
 # One rule per ISA: a pattern rule with several targets would mean that one run
