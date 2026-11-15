@@ -46,8 +46,6 @@
 // only the file-positioning names are remapped here, next to their users.
 #if defined(_WIN32)
 #include <io.h> /* _get_osfhandle, _fileno */
-#include <malloc.h>
-#include <sys/types.h>
 #include <windows.h>
 
 // Map POSIX file positioning functions to Windows equivalents
@@ -56,6 +54,7 @@
 #else
 #include <errno.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 // Below this block size the per-block system calls cost more than they save.
@@ -190,6 +189,8 @@ typedef struct {
  *      The index of the next job slot to be written to by the main thread.
  * @var zxc_stream_ctx_t::compression_level
  *      The configured level of compression (trading off speed vs. ratio).
+ * @var zxc_stream_ctx_t::split_budget_pct
+ *      Growth budget in percent, 0 = off; copied to each worker.
  * @var zxc_stream_ctx_t::chunk_size
  *      The size of each data chunk to be processed.
  * @var zxc_stream_ctx_t::checksum_enabled
@@ -249,6 +250,7 @@ typedef struct {
     int fail_code;
     int write_idx;
     int compression_level;
+    uint8_t split_budget_pct;
     size_t chunk_size;
     int checksum_enabled;
     int file_has_checksum;
@@ -537,6 +539,7 @@ static void* zxc_stream_worker(void* arg) {
     }
 
     cctx.compression_level = ctx->compression_level;
+    cctx.split_budget_pct = ctx->split_budget_pct;
 
     // Per-worker dict buffer for assembling [dict | block_data]
     const size_t dsz = ctx->dict_size;
@@ -1180,16 +1183,18 @@ static int zxc_stream_read_exact(zxc_stream_ctx_t* ctx, FILE* f, void* dst, cons
  * @param[in]  ctx          Started engine, or NULL before the first frame.
  * @param[in]  f_in         The input stream, just past the magic word.
  * @param[in]  magic        The magic word's 4 bytes.
- * @param[in]  dict_id      Id of the caller's dictionary, 0 without one.
+ * @param[in]  has_dict     Whether the caller holds a dictionary.
+ * @param[in]  dict_id      Its id, read when @p has_dict.
  * @param[out] chunk        The frame's block size.
  * @param[out] has_checksum Whether the frame carries checksums.
  * @param[out] has_seek     Whether it ends with a seek table.
  * @return @ref ZXC_OK, or a negative @ref zxc_error_t.
  */
 static int zxc_stream_read_frame_header(zxc_stream_ctx_t* ctx, FILE* f_in, const uint8_t* magic,
-                                        const uint32_t dict_id, size_t* chunk, int* has_checksum,
-                                        int* has_seek) {
+                                        const int has_dict, const uint32_t dict_id, size_t* chunk,
+                                        int* has_checksum, int* has_seek) {
     uint8_t h[ZXC_FILE_HEADER_SIZE];
+    int header_has_dict = 0;
     uint32_t header_dict_id = 0;
     ZXC_MEMCPY(h, magic, sizeof(uint32_t));
     const int rrc =
@@ -1198,10 +1203,13 @@ static int zxc_stream_read_frame_header(zxc_stream_ctx_t* ctx, FILE* f_in, const
     if (UNLIKELY(rrc != ZXC_OK)) return rrc == 1 ? ZXC_ERROR_SRC_TOO_SMALL : rrc;
 
     const int hrc = zxc_read_file_header(h, ZXC_FILE_HEADER_SIZE, chunk, has_checksum,
-                                         &header_dict_id, has_seek);
+                                         &header_has_dict, &header_dict_id, has_seek);
     if (UNLIKELY(hrc != ZXC_OK)) return hrc;
-    if (header_dict_id != 0) {
-        if (UNLIKELY(dict_id == 0)) return ZXC_ERROR_DICT_REQUIRED;
+    if (header_has_dict) {
+#ifdef ZXC_NO_DICT
+        return ZXC_ERROR_DICT_UNSUPPORTED;
+#endif
+        if (UNLIKELY(!has_dict)) return ZXC_ERROR_DICT_REQUIRED;
         if (UNLIKELY(dict_id != header_dict_id)) return ZXC_ERROR_DICT_MISMATCH;
     }
     return ZXC_OK;
@@ -1264,6 +1272,7 @@ int64_t zxc_stream_compress(FILE* f_in, FILE* f_out, const zxc_cctx* cfg) {
     const int n_threads = opts ? opts->n_threads : 0;
     const int checksum_enabled = opts ? opts->checksum_enabled : 0;
     const int seekable = opts ? opts->seekable : 0;
+    const uint8_t split_budget_pct = opts ? (uint8_t)opts->favor_decode_speed : 0;
     const int level = ZXC_OPTS_LEVEL(opts, ZXC_LEVEL_DEFAULT);
     const size_t block_size = ZXC_OPTS_BLOCK_SIZE(opts, ZXC_BLOCK_SIZE_DEFAULT);
     const uint8_t* dict = opts ? (const uint8_t*)opts->dict : NULL;
@@ -1277,6 +1286,7 @@ int64_t zxc_stream_compress(FILE* f_in, FILE* f_out, const zxc_cctx* cfg) {
     zxc_stream_ctx_t* const ctx = &e.ctx;
     ctx->compression_mode = 1;
     ctx->compression_level = level;
+    ctx->split_budget_pct = split_budget_pct;
     ctx->chunk_size = block_size;
     ctx->checksum_enabled = checksum_enabled;
     ctx->file_has_checksum = checksum_enabled;
@@ -1311,7 +1321,8 @@ int64_t zxc_stream_compress(FILE* f_in, FILE* f_out, const zxc_cctx* cfg) {
     if (f_out) {
         uint8_t h[ZXC_FILE_HEADER_SIZE];
         zxc_write_file_header(h, ZXC_FILE_HEADER_SIZE, block_size, checksum_enabled,
-                              zxc_dict_compute_id(dict, dict_size, dict_huf), seekable);
+                              dict && dict_size > 0, zxc_dict_compute_id(dict, dict_size, dict_huf),
+                              seekable);
         if (UNLIKELY(fwrite(h, 1, ZXC_FILE_HEADER_SIZE, f_out) != ZXC_FILE_HEADER_SIZE))
             ctx->io_error = 1;
     }
@@ -1370,8 +1381,8 @@ int64_t zxc_stream_decompress(FILE* f_in, FILE* f_out, const zxc_dctx* cfg) {
         size_t chunk = 0;
         int has_checksum = 0;
         int has_seek = 0;
-        rc = zxc_stream_read_frame_header(running ? &e.ctx : NULL, f_in, magic, dict_id, &chunk,
-                                          &has_checksum, &has_seek);
+        rc = zxc_stream_read_frame_header(running ? &e.ctx : NULL, f_in, magic, dict_size > 0,
+                                          dict_id, &chunk, &has_checksum, &has_seek);
         if (UNLIKELY(rc != ZXC_OK)) break;
 
         // The workers are set up for one block size and checksum flag.
@@ -1495,7 +1506,7 @@ int zxc_stream_get_last_frame_info(FILE* f_in, const uint64_t end, zxc_frame_inf
     } else {
         const zxc_scan_src_t src = {zxc_file_scan_read, NULL, f_in, end};
         uint64_t start = 0;
-        rc = zxc_scan_frame(&src, end, &start, &got, NULL);
+        rc = zxc_scan_frame(&src, end, &start, &got, NULL, NULL);
     }
     fseeko(f_in, saved, SEEK_SET);
     if (rc == ZXC_OK) zxc_frame_info_copy(info, info_size, &got);

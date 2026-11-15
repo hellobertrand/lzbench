@@ -21,11 +21,7 @@
 #include "../../include/zxc_error.h"
 #include "zxc_internal.h"
 
-// ZXC_DISABLE_SIMD => force ZXC_ONLY_DEFAULT so the dispatcher never selects
-// an AVX2/AVX512/NEON variant.
-#if defined(ZXC_DISABLE_SIMD) && !defined(ZXC_ONLY_DEFAULT)
-#define ZXC_ONLY_DEFAULT
-#endif
+// Roles bound to _default (ZXC_ONLY_DEFAULT and the rest): see zxc_build.h.
 
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -156,6 +152,23 @@ int zxc_compress_chunk_wrapper_neon32(zxc_cctx_t* RESTRICT ctx, const uint8_t* R
                                       const size_t dst_cap, const uint64_t block_index);
 #endif
 
+#ifdef ZXC_DISPATCH_ENTROPY
+// Entropy section decoders of the SIMD variants.
+#define ZXC_HUF_DECODE_PROTOTYPES(sfx)                                                           \
+    int zxc_huf_decode_section##sfx(const uint8_t* RESTRICT payload, size_t payload_size,        \
+                                    uint8_t* RESTRICT dst, size_t n, uint8_t* RESTRICT scratch); \
+    int zxc_huf_decode_section_dict##sfx(                                                        \
+        const uint8_t* RESTRICT payload, size_t payload_size, uint8_t* RESTRICT dst, size_t n,   \
+        const zxc_pivco_tree_t* RESTRICT tree, uint8_t* RESTRICT scratch)
+#if defined(__x86_64__) || defined(_M_X64)
+ZXC_HUF_DECODE_PROTOTYPES(_avx2);
+ZXC_HUF_DECODE_PROTOTYPES(_avx512);
+#elif defined(__arm__) || defined(_M_ARM)
+ZXC_HUF_DECODE_PROTOTYPES(_neon32);
+#endif
+#undef ZXC_HUF_DECODE_PROTOTYPES
+#endif
+
 // ============================================================================
 // CPU DETECTION LOGIC
 // ============================================================================
@@ -196,6 +209,17 @@ typedef int (*zxc_decompress_func_t)(const zxc_cctx_t* RESTRICT, const uint8_t* 
 /** @brief Function pointer type for the chunk compressor. */
 typedef int (*zxc_compress_func_t)(zxc_cctx_t* RESTRICT, const uint8_t* RESTRICT, const size_t,
                                    uint8_t* RESTRICT, const size_t, const uint64_t);
+#ifdef ZXC_DISPATCH_ENTROPY
+/** @brief Function pointer type for the entropy section decoder. */
+typedef int (*zxc_huf_decode_func_t)(const uint8_t* RESTRICT, size_t, uint8_t* RESTRICT, size_t,
+                                     uint8_t* RESTRICT);
+#ifndef ZXC_NO_DICT
+/** @brief Function pointer type for the shared-table entropy section decoder. */
+typedef int (*zxc_huf_decode_dict_func_t)(const uint8_t* RESTRICT, size_t, uint8_t* RESTRICT,
+                                          size_t, const zxc_pivco_tree_t* RESTRICT,
+                                          uint8_t* RESTRICT);
+#endif
+#endif
 
 #ifndef ZXC_ONLY_DEFAULT
 
@@ -207,8 +231,7 @@ typedef enum {
     ZXC_CPU_GENERIC = 0, /**< @brief Scalar-only fallback.   */
     ZXC_CPU_AVX2 = 1,    /**< @brief x86-64 AVX2 available.  */
     ZXC_CPU_AVX512 = 2,  /**< @brief x86-64 AVX-512F+BW available. */
-    ZXC_CPU_NEON = 3,    /**< @brief ARM NEON available (dedicated variant on 32-bit ARM only;
-                          *          AArch64 baseline, served by _default there). */
+    ZXC_CPU_NEON = 3,    /**< @brief 32-bit ARM NEON available. */
     ZXC_CPU_SSE2 = 4     /**< @brief x86 SSE2 available (no AVX2); x86-64 baseline,
                           *          served by _default (no dedicated variant). */
 } zxc_cpu_feature_t;
@@ -216,8 +239,8 @@ typedef enum {
 /**
  * @brief Probes the running CPU for SIMD support.
  *
- * Uses CPUID on x86-64 (MSVC and GCC/Clang paths), `getauxval` on
- * 32-bit ARM Linux, and compile-time constants on AArch64.
+ * Uses CPUID on x86-64 (MSVC and GCC/Clang paths) and `getauxval` on
+ * 32-bit ARM Linux.
  *
  * @return The highest @ref zxc_cpu_feature_t level supported.
  */
@@ -247,9 +270,9 @@ static zxc_cpu_feature_t zxc_detect_cpu_features(void) {
             const int bmi2 = (regs[1] >> 8) & 1;  // CPUID.7.0:EBX[8]
             if (regs[1] & (1U << 5)) avx2 = 1;
             // AVX512 also needs XCR0[5..7] (opmask/ZMM)
-            if ((regs[1] & (1U << 16)) && (regs[1] & (1U << 30)) && (regs[2] & (1U << 1)) &&
-                (regs[2] & (1U << 6)) && (xcr0 & 0xE0) == 0xE0)
-                avx512 = 1; /* AVX512 tier = F+BW+VBMI+VBMI2, as the variant is built */
+            if ((regs[1] & (1U << 16)) && (regs[1] & (1U << 30)) && (regs[1] & (1U << 31)) &&
+                (regs[2] & (1U << 1)) && (regs[2] & (1U << 6)) && (xcr0 & 0xE0) == 0xE0)
+                avx512 = 1; /* AVX512 tier = F+BW+VL+VBMI+VBMI2, as the variant is built */
             // The AVX2/AVX512 variants are compiled with BMI1/BMI2/LZCNT enabled,
             // so both gates must prove those bits too. LZCNT (ABM) lives in
             // CPUID.80000001H:ECX[5]; that leaf is architectural on x86-64.
@@ -265,10 +288,6 @@ static zxc_cpu_feature_t zxc_detect_cpu_features(void) {
     } else if (sse2) {
         features = ZXC_CPU_SSE2;
     }
-
-#elif defined(__aarch64__) || defined(_M_ARM64)
-    // ARM64 usually guarantees NEON
-    features = ZXC_CPU_NEON;
 
 #elif defined(__arm__) || defined(_M_ARM)
     // ARM32 Runtime detection for Linux
@@ -301,34 +320,81 @@ static zxc_cpu_feature_t zxc_detect_cpu_features(void) {
 
 /**
  * @struct zxc_variant_set_t
- * @brief The three chunk entry points of one ISA variant; adding a tier is one
- *        line here.
+ * @brief The entry points of one ISA tier; adding a tier is one line here.
+ *
+ * A role bound to `_default` holds that symbol in every set.
  *
  * The `_safe` decoder is kept out on purpose: a table entry is a reference the
  * linker cannot prove dead, so every static link would carry its decoders.
  */
 typedef struct {
     zxc_decompress_func_t decompress;
+#ifndef ZXC_NO_DICT
     zxc_decompress_func_t decompress_dict;
+#endif
     zxc_compress_func_t compress;
+#ifdef ZXC_DISPATCH_ENTROPY
+    zxc_huf_decode_func_t huf_decode;
+#ifndef ZXC_NO_DICT
+    zxc_huf_decode_dict_func_t huf_decode_dict;
+#endif
+#endif
 } zxc_variant_set_t;
 
-/** @brief Defines the constant variant set of suffix @p sfx. */
-#define ZXC_VARIANT_SET(sfx)                                                                    \
-    static const zxc_variant_set_t zxc_variants##sfx = {zxc_decompress_chunk_wrapper##sfx,      \
-                                                        zxc_decompress_chunk_wrapper_dict##sfx, \
-                                                        zxc_compress_chunk_wrapper##sfx}
+#define ZXC_GLUE_IMPL(a, b) a##b
+#define ZXC_GLUE(a, b) ZXC_GLUE_IMPL(a, b)
+
+/** @brief Suffix of a role in the set of tier @p sfx. */
+#ifdef ZXC_LZ_DECODER_DEFAULT
+#define ZXC_DEC_SFX(sfx) _default
+#else
+#define ZXC_DEC_SFX(sfx) sfx
+#endif
+#ifdef ZXC_ENCODER_DEFAULT
+#define ZXC_ENC_SFX(sfx) _default
+#else
+#define ZXC_ENC_SFX(sfx) sfx
+#endif
+
+#ifndef ZXC_NO_DICT
+#define ZXC_VARIANT_DICT(sfx) \
+    .decompress_dict = ZXC_GLUE(zxc_decompress_chunk_wrapper_dict, ZXC_DEC_SFX(sfx)),
+#else
+#define ZXC_VARIANT_DICT(sfx)
+#endif
+
+#if defined(ZXC_DISPATCH_ENTROPY) && !defined(ZXC_NO_DICT)
+#define ZXC_VARIANT_HUF(sfx) \
+    .huf_decode = zxc_huf_decode_section##sfx, .huf_decode_dict = zxc_huf_decode_section_dict##sfx,
+#elif defined(ZXC_DISPATCH_ENTROPY)
+#define ZXC_VARIANT_HUF(sfx) .huf_decode = zxc_huf_decode_section##sfx,
+#else
+#define ZXC_VARIANT_HUF(sfx)
+#endif
+
+/** @brief Defines the constant variant set of tier @p sfx. */
+#define ZXC_VARIANT_SET(sfx)                                                    \
+    static const zxc_variant_set_t zxc_variants##sfx = {                        \
+        .decompress = ZXC_GLUE(zxc_decompress_chunk_wrapper, ZXC_DEC_SFX(sfx)), \
+        .compress = ZXC_GLUE(zxc_compress_chunk_wrapper, ZXC_ENC_SFX(sfx)),     \
+        ZXC_VARIANT_DICT(sfx) ZXC_VARIANT_HUF(sfx)}
 
 ZXC_VARIANT_SET(_default);
 #ifndef ZXC_ONLY_DEFAULT
 #if defined(__x86_64__) || defined(_M_X64)
 ZXC_VARIANT_SET(_avx2);
+#ifndef ZXC_NO_AVX512
 ZXC_VARIANT_SET(_avx512);
+#endif
 #elif defined(__arm__) || defined(_M_ARM)
 ZXC_VARIANT_SET(_neon32);
 #endif
 #endif
 #undef ZXC_VARIANT_SET
+#undef ZXC_VARIANT_HUF
+#undef ZXC_VARIANT_DICT
+#undef ZXC_ENC_SFX
+#undef ZXC_DEC_SFX
 
 #ifdef ZXC_ONLY_DEFAULT
 /** @brief The variant set in use: `_default`, bound at compile time. */
@@ -345,14 +411,16 @@ static ZXC_ALWAYS_INLINE const zxc_variant_set_t* zxc_variants(void) {
 static const zxc_variant_set_t* zxc_select_variants(void) {
     const zxc_cpu_feature_t cpu = zxc_detect_cpu_features();
 #if defined(__x86_64__) || defined(_M_X64)
+#ifdef ZXC_NO_AVX512
+    if (cpu == ZXC_CPU_AVX512 || cpu == ZXC_CPU_AVX2) return &zxc_variants_avx2;
+#else
     if (cpu == ZXC_CPU_AVX512) return &zxc_variants_avx512;
     if (cpu == ZXC_CPU_AVX2) return &zxc_variants_avx2;
+#endif
 #elif defined(__arm__) || defined(_M_ARM)
     // 32-bit ARM: the only arch with a real runtime NEON probe (getauxval).
     // cppcheck-suppress knownConditionTrueFalse
     if (cpu == ZXC_CPU_NEON) return &zxc_variants_neon32;
-#else
-    (void)cpu;
 #endif
     return &zxc_variants_default;
 }
@@ -387,7 +455,7 @@ static ZXC_ALWAYS_INLINE const zxc_variant_set_t* zxc_variants(void) {
 }
 #endif  // ZXC_ONLY_DEFAULT
 
-#ifdef ZXC_ONLY_DEFAULT
+#ifdef ZXC_LZ_DECODER_DEFAULT
 /** @brief The `_safe` decoder in use: `_default`, bound at compile time. */
 static ZXC_ALWAYS_INLINE zxc_decompress_func_t zxc_decompress_safe_variant(void) {
     return zxc_decompress_chunk_wrapper_safe_default;
@@ -402,12 +470,12 @@ static ZXC_COLD ZXC_NOINLINE zxc_decompress_func_t zxc_decompress_safe_resolve(v
     const zxc_variant_set_t* v = zxc_variants();
     zxc_decompress_func_t f = zxc_decompress_chunk_wrapper_safe_default;
 #if defined(__x86_64__) || defined(_M_X64)
+#ifndef ZXC_NO_AVX512
     if (v == &zxc_variants_avx512) f = zxc_decompress_chunk_wrapper_safe_avx512;
+#endif
     if (v == &zxc_variants_avx2) f = zxc_decompress_chunk_wrapper_safe_avx2;
 #elif defined(__arm__) || defined(_M_ARM)
     if (v == &zxc_variants_neon32) f = zxc_decompress_chunk_wrapper_safe_neon32;
-#else
-    (void)v;
 #endif
 #if ZXC_USE_C11_ATOMICS
     atomic_store_explicit(&zxc_decompress_safe_ptr, f, memory_order_release);
@@ -428,7 +496,7 @@ static ZXC_ALWAYS_INLINE zxc_decompress_func_t zxc_decompress_safe_variant(void)
     if (UNLIKELY(!f)) f = zxc_decompress_safe_resolve();
     return f;
 }
-#endif  // ZXC_ONLY_DEFAULT
+#endif  // ZXC_LZ_DECODER_DEFAULT
 
 /** @brief Public decompression dispatcher. */
 int zxc_decompress_chunk_wrapper(const zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRICT src,
@@ -438,8 +506,13 @@ int zxc_decompress_chunk_wrapper(const zxc_cctx_t* RESTRICT ctx, const uint8_t* 
     // loop) routes to the dict variant only when a dictionary is active, so the
     // no-dict path runs the dict-free chunk wrapper (identical codegen to main).
     const zxc_variant_set_t* v = zxc_variants();
+#ifdef ZXC_NO_DICT
+    // dict_size is always 0.
+    return v->decompress(ctx, src, src_sz, dst, dst_cap, block_index);
+#else
     return (ctx->dict_size ? v->decompress_dict : v->decompress)(ctx, src, src_sz, dst, dst_cap,
                                                                  block_index);
+#endif
 }
 
 /**
@@ -481,6 +554,7 @@ int zxc_compress_chunk_wrapper(zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRICT
 //
 // These thin wrappers exist only for tests and external callers that link
 // against the un-suffixed names. They forward to the default (scalar) variant.
+// With ZXC_DISPATCH_ENTROPY, the two section decoders dispatch per CPU instead.
 /**
  * @brief Build length-limited per-symbol Huffman code lengths from frequencies.
  *
@@ -506,7 +580,11 @@ int zxc_huf_encode_section(const uint8_t* RESTRICT literals, const size_t n_lite
 
 int zxc_huf_decode_section(const uint8_t* RESTRICT payload, const size_t payload_size,
                            uint8_t* RESTRICT dst, const size_t n, uint8_t* RESTRICT scratch) {
+#ifdef ZXC_DISPATCH_ENTROPY
+    return zxc_variants()->huf_decode(payload, payload_size, dst, n, scratch);
+#else
     return zxc_huf_decode_section_default(payload, payload_size, dst, n, scratch);
+#endif
 }
 
 int zxc_huf_encode_section_dict(const uint8_t* RESTRICT literals, const size_t n_literals,
@@ -521,7 +599,11 @@ int zxc_huf_encode_section_dict(const uint8_t* RESTRICT literals, const size_t n
 int zxc_huf_decode_section_dict(const uint8_t* RESTRICT payload, const size_t payload_size,
                                 uint8_t* RESTRICT dst, const size_t n,
                                 const zxc_pivco_tree_t* RESTRICT tree, uint8_t* RESTRICT scratch) {
+#if defined(ZXC_DISPATCH_ENTROPY) && !defined(ZXC_NO_DICT)
+    return zxc_variants()->huf_decode_dict(payload, payload_size, dst, n, tree, scratch);
+#else
     return zxc_huf_decode_section_dict_default(payload, payload_size, dst, n, tree, scratch);
+#endif
 }
 
 size_t zxc_huf_calc_size_dict(const uint32_t* RESTRICT freq, const uint8_t* RESTRICT code_len,
@@ -566,9 +648,9 @@ int zxc_huf_unpack_lengths(const uint8_t* RESTRICT in, uint8_t* RESTRICT code_le
  */
 static int64_t zxc_write_empty_frame(uint8_t* RESTRICT dst, const size_t dst_capacity,
                                      const size_t block_size, const int checksum_enabled,
-                                     const uint32_t did, const int seekable) {
-    const int h =
-        zxc_write_file_header(dst, dst_capacity, block_size, checksum_enabled, did, seekable);
+                                     const int has_dict, const uint32_t did, const int seekable) {
+    const int h = zxc_write_file_header(dst, dst_capacity, block_size, checksum_enabled, has_dict,
+                                        did, seekable);
     if (UNLIKELY(h < 0)) return h;
     size_t off = (size_t)h;
 
@@ -866,6 +948,21 @@ uint32_t zxc_get_dict_id(const void* src, const size_t src_size) {
 }
 
 /**
+ * @brief Tells whether an archive requires a dictionary, from its header.
+ *
+ * Public API; see @c zxc_buffer.h.
+ */
+// cppcheck-suppress unusedFunction
+int zxc_requires_dict(const void* src, const size_t src_size) {
+    if (UNLIKELY(!src)) return ZXC_ERROR_NULL_INPUT;
+    size_t chunk = 0;  // asked for so the block size code is checked too
+    int has_dict = 0;
+    const int rc =
+        zxc_read_file_header((const uint8_t*)src, src_size, &chunk, NULL, &has_dict, NULL, NULL);
+    return rc != ZXC_OK ? rc : has_dict;
+}
+
+/**
  * @brief Reads a frame's header and footer, without decoding.
  *
  * Public API; see @c zxc_buffer.h.
@@ -892,7 +989,7 @@ int zxc_get_last_frame_info(const void* src, const size_t src_size, zxc_frame_in
     const zxc_scan_src_t scan = zxc_scan_src_mem((const uint8_t*)src, src_size);
     zxc_frame_info_t got;
     uint64_t start = 0;
-    const int rc = zxc_scan_frame(&scan, src_size, &start, &got, NULL);
+    const int rc = zxc_scan_frame(&scan, src_size, &start, &got, NULL, NULL);
     if (rc == ZXC_OK) zxc_frame_info_copy(info, info_size, &got);
     return rc;
 }
@@ -912,6 +1009,7 @@ typedef struct {
     int level;
     int checksum;
     int seekable;
+    uint8_t split_budget_pct; /* ZXC_C_FAVOR_DECODE_SPEED, 0 = off */
     size_t block_size;
 } zxc_cctx_opts_t;
 
@@ -996,6 +1094,7 @@ static zxc_cctx_opts_t zxc_cparams_resolve(const zxc_cparams_t* p) {
     return (zxc_cctx_opts_t){.level = p->level,
                              .checksum = p->checksum_enabled,
                              .seekable = p->seekable,
+                             .split_budget_pct = (uint8_t)p->favor_decode_speed,
                              .block_size = p->block_size};
 }
 
@@ -1033,6 +1132,10 @@ int zxc_cparam_bounds(const zxc_cparam_t param, int64_t* min, int64_t* max) {
         case ZXC_C_SEEKABLE:
             lo = 0;
             hi = 1;
+            break;
+        case ZXC_C_FAVOR_DECODE_SPEED:
+            lo = 1;
+            hi = ZXC_FAVOR_DECODE_SPEED_MAX;
             break;
         default:
             return ZXC_ERROR_BAD_PARAM;
@@ -1092,6 +1195,9 @@ int zxc_cctx_set_param(zxc_cctx* cctx, const zxc_cparam_t param, const int64_t v
         case ZXC_C_SEEKABLE:
             p->seekable = (int)value;
             break;
+        case ZXC_C_FAVOR_DECODE_SPEED:
+            p->favor_decode_speed = (int)value;
+            break;
         default:
             return ZXC_ERROR_BAD_PARAM;  // LCOV_EXCL_LINE: bounds already refused it
     }
@@ -1117,6 +1223,9 @@ int zxc_cctx_get_param(const zxc_cctx* cctx, const zxc_cparam_t param, int64_t* 
         case ZXC_C_SEEKABLE:
             *value = p->seekable;
             break;
+        case ZXC_C_FAVOR_DECODE_SPEED:
+            *value = p->favor_decode_speed;
+            break;
         default:
             return ZXC_ERROR_BAD_PARAM;
     }
@@ -1126,6 +1235,10 @@ int zxc_cctx_get_param(const zxc_cctx* cctx, const zxc_cparam_t param, int64_t* 
 int zxc_cctx_set_dict(zxc_cctx* cctx, const void* dict, const size_t dict_size,
                       const void* dict_huf) {
     if (UNLIKELY(!cctx)) return ZXC_ERROR_NULL_INPUT;
+#ifdef ZXC_NO_DICT
+    // No dictionary support: clearing is a no-op.
+    if (UNLIKELY(dict && dict_size > 0)) return ZXC_ERROR_DICT_UNSUPPORTED;
+#endif
     // No room for the dictionary prefix in a workspace carved without it.
     if (UNLIKELY(cctx->owns_workspace && dict && dict_size > 0)) return ZXC_ERROR_DICT_UNSUPPORTED;
     const int rc = zxc_dict_copy_set(&cctx->dict_copy, dict, dict_size, dict_huf);
@@ -1192,13 +1305,13 @@ static int64_t zxc_compress_cctx_resolved(zxc_cctx* cctx, const void* RESTRICT s
     // The encoder sees [dict | block], so the carved chunk covers both.
     const size_t eff_chunk =
         dict_size > 0 ? zxc_block_size_ceil(dict_size + o.block_size) : o.block_size;
-    const uint32_t did =
-        (dict && dict_size > 0) ? zxc_dict_compute_id(dict, dict_size, dict_huf) : 0;
+    const int has_dict = dict && dict_size > 0;
+    const uint32_t did = has_dict ? zxc_dict_compute_id(dict, dict_size, dict_huf) : 0;
 
     // Empty source: same writer as the one-shot, workspace left alone.
     if (UNLIKELY(src_size == 0))
-        return zxc_write_empty_frame((uint8_t*)dst, dst_capacity, o.block_size, o.checksum, did,
-                                     o.seekable);
+        return zxc_write_empty_frame((uint8_t*)dst, dst_capacity, o.block_size, o.checksum,
+                                     has_dict, did, o.seekable);
 
     // Re-init when the chunk changed, a level raise needs the optimal-parser
     // scratch, or a dictionary arrives on a context carved without its prefix.
@@ -1224,6 +1337,7 @@ static int64_t zxc_compress_cctx_resolved(zxc_cctx* cctx, const void* RESTRICT s
     }
 
     zxc_cctx_t* const ctx = &cctx->inner;
+    ctx->split_budget_pct = o.split_budget_pct;
     ctx->dict_size = dict_size;
     if (UNLIKELY(zxc_ctx_sync_dict_huf(ctx, cctx->huf_cache, &cctx->huf_cached, dict_huf) !=
                  ZXC_OK))
@@ -1238,8 +1352,8 @@ static int64_t zxc_compress_cctx_resolved(zxc_cctx* cctx, const void* RESTRICT s
     const uint8_t* const op_end = op + dst_capacity;
     const uint8_t* const ip = (const uint8_t*)src;
 
-    const int h_val =
-        zxc_write_file_header(op, (size_t)(op_end - op), o.block_size, o.checksum, did, o.seekable);
+    const int h_val = zxc_write_file_header(op, (size_t)(op_end - op), o.block_size, o.checksum,
+                                            has_dict, did, o.seekable);
     if (UNLIKELY(h_val < 0)) return h_val;  // LCOV_EXCL_LINE
     op += h_val;
 
@@ -1391,6 +1505,10 @@ int zxc_dctx_get_param(const zxc_dctx* dctx, const zxc_dparam_t param, int64_t* 
 int zxc_dctx_set_dict(zxc_dctx* dctx, const void* dict, const size_t dict_size,
                       const void* dict_huf) {
     if (UNLIKELY(!dctx)) return ZXC_ERROR_NULL_INPUT;
+#ifdef ZXC_NO_DICT
+    // No dictionary support: clearing is a no-op.
+    if (UNLIKELY(dict && dict_size > 0)) return ZXC_ERROR_DICT_UNSUPPORTED;
+#endif
     if (UNLIKELY(dctx->owns_workspace && dict && dict_size > 0)) return ZXC_ERROR_DICT_UNSUPPORTED;
     const int rc = zxc_dict_copy_set(&dctx->dict_copy, dict, dict_size, dict_huf);
     if (UNLIKELY(rc != ZXC_OK)) return rc;
@@ -1546,10 +1664,11 @@ static int64_t zxc_dctx_decode_frame(zxc_dctx* dctx, const uint8_t* src, const s
     size_t runtime_chunk_size = 0;
     int file_has_checksums = 0;
     int file_has_seek = 0;
+    int header_has_dict = 0;
     uint32_t header_dict_id = 0;
 
     const int hrc = zxc_read_file_header(ip, src_size, &runtime_chunk_size, &file_has_checksums,
-                                         &header_dict_id, &file_has_seek);
+                                         &header_has_dict, &header_dict_id, &file_has_seek);
     if (UNLIKELY(hrc != ZXC_OK)) return hrc;
 
     // Static dctx: block_size is locked at workspace init; reject any
@@ -1557,11 +1676,14 @@ static int64_t zxc_dctx_decode_frame(zxc_dctx* dctx, const uint8_t* src, const s
     if (UNLIKELY(dctx->owns_workspace && runtime_chunk_size != dctx->last_block_size))
         return ZXC_ERROR_BAD_BLOCK_SIZE;
     // Static dctx: no room for a dictionary prefix.
-    if (UNLIKELY(dctx->owns_workspace && (header_dict_id != 0 || dict_size != 0)))
+    if (UNLIKELY(dctx->owns_workspace && (header_has_dict || dict_size != 0)))
         return ZXC_ERROR_DICT_UNSUPPORTED;
 
     // Dictionary binding: same contract as zxc_decompress().
-    if (header_dict_id != 0) {
+    if (header_has_dict) {
+#ifdef ZXC_NO_DICT
+        return ZXC_ERROR_DICT_UNSUPPORTED;
+#endif
         if (UNLIKELY(!dict || dict_size == 0)) return ZXC_ERROR_DICT_REQUIRED;
         if (UNLIKELY(zxc_dict_compute_id(dict, dict_size, dict_huf) != header_dict_id))
             return ZXC_ERROR_DICT_MISMATCH;
@@ -1638,8 +1760,8 @@ static int64_t zxc_dctx_decode_frame(zxc_dctx* dctx, const uint8_t* src, const s
         }
 
         // The block's room: the rest of dst, in place cut at the unread input. The
-        // fast decoder never writes past its capacity; a block that does not fit
-        // decodes aside and copies only its real output.
+        // fast decoder needs a whole block plus its margin there; short of that, the
+        // strict decoder writes straight to dst, which spares the copy.
         const size_t rem_cap = (size_t)(op_end - op);
         size_t room = rem_cap;
         if (inplace) {
@@ -1656,9 +1778,17 @@ static int64_t zxc_dctx_decode_frame(zxc_dctx* dctx, const uint8_t* src, const s
         } else if (LIKELY(room >= work_sz)) {
             res = zxc_decompress_chunk_wrapper(ctx, ip, rem_src, op, work_sz, block_index);
         } else {
-            res = zxc_decompress_chunk_wrapper(ctx, ip, rem_src, ctx->work_buf, ctx->work_buf_cap,
-                                               block_index);
-            bounce = ctx->work_buf;
+            res = ZXC_ERROR_OVERFLOW;
+            if (!inplace && room)
+                res = zxc_decompress_chunk_wrapper_safe_public(ctx, ip, rem_src, op, room,
+                                                               block_index);
+            // Any failure is settled aside: it keeps the bounce path's verdict, and
+            // this is the path that tells a short dst from a corrupt block.
+            if (UNLIKELY(res < 0)) {
+                res = zxc_decompress_chunk_wrapper(ctx, ip, rem_src, ctx->work_buf,
+                                                   ctx->work_buf_cap, block_index);
+                bounce = ctx->work_buf;
+            }
         }
         if (bounce && LIKELY(res > 0)) {
             // A no-destination probe lands here too. In place, output past the
@@ -1767,6 +1897,7 @@ static int64_t zxc_compress_block_resolved(zxc_cctx* cctx, const void* RESTRICT 
         cctx->inner.checksum_enabled = o.checksum;
     }
 
+    cctx->inner.split_budget_pct = o.split_budget_pct;
     cctx->inner.dict_size = b_dict_size;
     if (UNLIKELY(zxc_ctx_sync_dict_huf(&cctx->inner, cctx->huf_cache, &cctx->huf_cached,
                                        ZXC_OPTS_DICT_HUF(opts)) != ZXC_OK))

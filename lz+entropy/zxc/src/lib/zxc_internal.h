@@ -38,7 +38,7 @@
 #include "../../include/zxc_constants.h"
 #include "../../include/zxc_error.h"
 #include "../../include/zxc_seekable.h"
-#include "rapidhash.h"
+#include "zxc_build.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -92,13 +92,13 @@ extern "C" {
  * emulated with pure SSE2 instruction sequences or fall back to scalar code.
  *
  * Define @c ZXC_DISABLE_SIMD to gate all hand-written SIMD paths (intrinsics,
- * inline assembly).  Compiler auto-vectorisation is unaffected.
+ * inline assembly), as wasm, the kernel module and scalar fuzzers do.
+ * Compiler auto-vectorisation is unaffected.
  * @{
  */
 #ifndef ZXC_DISABLE_SIMD
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
-#include <nmmintrin.h>
 #if defined(__AVX512F__) && defined(__AVX512BW__)
 #ifndef ZXC_USE_AVX512
 #define ZXC_USE_AVX512
@@ -116,9 +116,6 @@ extern "C" {
 #endif
 #elif (defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(_M_ARM64) || \
        defined(ZXC_USE_NEON32) || defined(ZXC_USE_NEON64))
-#if !defined(_MSC_VER)
-#include <arm_acle.h>
-#endif
 #include <arm_neon.h>
 #if defined(__aarch64__) || defined(_M_ARM64)
 #ifndef ZXC_USE_NEON64
@@ -256,6 +253,19 @@ extern "C" {
  */
 #define ZXC_ALIGN(x) _Alignas(x)
 #endif
+
+/** @def ZXC_MSAN_UNPOISON
+ * @brief Marks @p n bytes at @p p initialised under MemorySanitizer; no-op elsewhere.
+ */
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+#include <sanitizer/msan_interface.h>
+#define ZXC_MSAN_UNPOISON(p, n) __msan_unpoison((p), (n))
+#endif
+#endif
+#ifndef ZXC_MSAN_UNPOISON
+#define ZXC_MSAN_UNPOISON(p, n) ((void)0)
+#endif
 /** @} */ /* end of Compiler Abstractions */
 
 // Heap allocator and cache-line-aligned allocator macros are now defined
@@ -323,8 +333,8 @@ static inline int zxc_magic_prefix_ok(const uint8_t* p, const size_t n) {
         if (p[i] != magic[i]) return 0;
     return 1;
 }
-/** @brief Current on-disk file format version. The decoder accepts only this
- *  version; Older versions are rejected with ZXC_ERROR_BAD_VERSION. */
+/** @brief Current on-disk file format version. A decoder for version N reads 9 to N
+ *  (FORMAT.md Sec 10.3); others get ZXC_ERROR_BAD_VERSION. */
 #define ZXC_FILE_FORMAT_VERSION 9
 
 /** @brief Safety padding appended to buffers to tolerate overruns. */
@@ -448,7 +458,7 @@ static_assert(ZXC_BLOCK_FORMAT_OVERHEAD >=
                   ZXC_SPL_HEADER_BINARY_SIZE + ZXC_SPL_DESC_MAX_SIZE + ZXC_BLOCK_LIT_SLACK,
               "ZXC_BLOCK_FORMAT_OVERHEAD must cover sub-header, descriptors and slack");
 
-/** @brief Checksum algorithm id for RapidHash (default, sole implementation). */
+/** @brief Checksum algorithm id for RapidHash (default, sole implementation so far). */
 #define ZXC_CHECKSUM_RAPIDHASH 0
 
 /** @name Seekable Format Constants
@@ -670,6 +680,43 @@ static ZXC_ALWAYS_INLINE uint32_t zxc_read_varint(const uint8_t** ptr, const uin
  * 32-byte store covers it. The escape path always yields more, so comparing
  * against this recovers "was the ml nibble inline". */
 #define ZXC_SPL_MAX_INLINE_ML (ZXC_SPL_INLINE_ML_CODE + ZXC_LZ_MIN_MATCH_LEN) /* 19 */
+/** @name Per-block match splitting (zxc_spl_match_split_block)
+ *
+ *  Escaped matches go out as inline pieces at the same offset, so the decoder
+ *  skips their ML escape: by default up to the level's split_max where the
+ *  escape looks mispredicted (levels 3-5), and with favor_decode_speed also
+ *  every escape up to ZXC_SPL_MATCH_SPLIT_MAX within a growth budget.
+ *  @{ */
+/** @brief Longest escape history a context keys on; small blocks shorten it
+ *         (down to 2 bits) towards 16 samples per context. Sizes the histograms. */
+#define ZXC_SPL_MATCH_SPLIT_CTX_BITS 8
+/** @brief Mispredict rate, in percent of a block's escapes, from which the
+ *         default policy splits the block. */
+#define ZXC_SPL_MATCH_SPLIT_MIN_MISPREDICT_PCT 80
+/** @brief zxc_spl_match_split_analyze's escape histograms: four rotating lanes of
+ *         [escape][context] counts, carved from the compression workspace. */
+typedef uint32_t zxc_spl_match_split_hist_t[4][2][1U << ZXC_SPL_MATCH_SPLIT_CTX_BITS];
+static_assert(ZXC_SPL_MATCH_SPLIT_CTX_BITS <= CHAR_BIT,
+              "a context is recorded in one byte of buf_split");
+/** @brief Longest match favor_decode_speed splits, as a length code: 128 bytes.
+ *
+ * Knee on silesia (M3, 2026-10-17): 0.3 percent of the sequences stay
+ * escaped; a higher cap only adds sequences, the escapes left being long and
+ * predictable. */
+#define ZXC_SPL_MATCH_SPLIT_MAX (128U - ZXC_LZ_MIN_MATCH_LEN) /* 123 */
+static_assert(ZXC_SPL_MATCH_SPLIT_MAX < (1U << ZXC_SPL_MATCH_SPLIT_CTX_BITS),
+              "the budget's histogram is one lane of zxc_spl_match_split_hist_t");
+/** @brief Shortest offset favor_decode_speed splits at. Below it the decoder copies
+ *         a match with one overlap run, but each piece with a dependent shuffle:
+ *         splitting made decode slower (-12 to -14 percent on short periods). */
+#define ZXC_SPL_MATCH_SPLIT_MIN_OFFSET ZXC_PAD_SIZE
+/*
+ * The budget is ZXC_C_FAVOR_DECODE_SPEED's value, 0 = off, else 1 to
+ * ZXC_FAVOR_DECODE_SPEED_MAX (the setter bounds it): an unbounded split inflates
+ * blocks that compress well (JSON records: +45 percent at 128 bytes), so each
+ * block may grow by this share of its size before entropy coding.
+ */
+/** @} */
 #define ZXC_PAK_MAX_INLINE_OUT_PER_SEQ \
     ((ZXC_SEQ_LL_MASK - 1U) + (ZXC_SEQ_ML_MASK - 1U) + ZXC_LZ_MIN_MATCH_LEN) /* 513 */
 /** @brief Base bias added to encoded offsets (stored = actual - bias). */
@@ -962,6 +1009,7 @@ typedef struct {
     size_t block_size;
     int checksum_enabled;
     int seekable;
+    int favor_decode_speed; /* growth budget in percent, 0 = off */
     const void* dict;
     size_t dict_size;
     const void* dict_huf;
@@ -993,27 +1041,6 @@ typedef struct {
 #define ZXC_OPTS_LEVEL(o, dflt) (((o) && (o)->level != 0) ? (o)->level : (dflt))
 /** @brief Block size, 0 meaning the default. */
 #define ZXC_OPTS_BLOCK_SIZE(o, dflt) (((o) && (o)->block_size > 0) ? (o)->block_size : (dflt))
-/** @name Per-block match splitting (zxc_spl_match_split_block), a level-table policy
- *
- *  Escaped matches up to split_max (a length code; 14 is the inline reach) go
- *  out as inline pieces at the same offset, so the decoder skips its ML escape.
- *  Two gates: the block's escape branch must look mispredicted, then only the
- *  escapes of mispredicted contexts split; a predictable one would only add
- *  sequences. A split_max at or below the inline reach (levels 1, 2, 6, 7 in
- *  the level table) turns the pass off.
- *  @{ */
-/** @brief Longest escape history a context keys on; small blocks shorten it
- *         (down to 2 bits) towards 16 samples per context. Sizes the histograms. */
-#define ZXC_SPL_MATCH_SPLIT_CTX_BITS 8
-/** @brief Mispredict rate, in percent of a block's escapes, from which the
- *         block is split. */
-#define ZXC_SPL_MATCH_SPLIT_MIN_MISPREDICT_PCT 80
-/** @brief zxc_spl_match_split_analyze's escape histograms: four rotating lanes of
- *         [escape][context] counts, carved from the compression workspace. */
-typedef uint32_t zxc_spl_match_split_hist_t[4][2][1U << ZXC_SPL_MATCH_SPLIT_CTX_BITS];
-static_assert(ZXC_SPL_MATCH_SPLIT_CTX_BITS <= CHAR_BIT,
-              "a context is recorded in one byte of buf_split");
-/** @} */
 
 /** @brief Encoder Huffman code-length cap for a compression @p level: levels below
  *         ::ZXC_LEVEL_ULTRA use ::ZXC_HUF_MAX_CODE_LEN_DENSITY, ::ZXC_LEVEL_ULTRA uses
@@ -1220,7 +1247,8 @@ typedef struct {
  */
 static ZXC_ALWAYS_INLINE zxc_lz77_params_t zxc_get_lz77_params(const int level) {
     // The distance floor stops at level 5: the slow levels keep every distance.
-    // Match splitting at levels 3-5 only: 1-2 are PAK, 6-7 keep every escape.
+    // Default match splitting at levels 3-5 only: 1-2 are PAK; favor_decode_speed
+    // also reaches 6-7.
     // search_depth, sufficient_len, use_lazy, lazy_attempts, lazy_len_threshold, step_base,
     // step_shift, min_offset, split_max
     static const zxc_lz77_params_t table[7] = {
@@ -1550,7 +1578,8 @@ static ZXC_ALWAYS_INLINE void zxc_copy16(void* dst, const void* src) {
 /**
  * @brief Copies 32 bytes from source to destination using SIMD when available.
  *
- * Uses AVX2 on x86, NEON on ARM64/ARM32, or two 16-byte copies as fallback.
+ * Uses AVX2/AVX-512, two SSE2/NEON halves, two 16-byte halves on fast-misaligned
+ * RISC-V without V, otherwise one 32-byte memcpy.
  *
  * @param[out] dst Pointer to the destination memory block.
  * @param[in] src Pointer to the source memory block.
@@ -1569,6 +1598,12 @@ static ZXC_ALWAYS_INLINE void zxc_copy32(void* dst, const void* src) {
     const uint8x16_t b = vld1q_u8((const uint8_t*)src + 16);
     vst1q_u8((uint8_t*)dst, a);
     vst1q_u8((uint8_t*)dst + 16, b);
+#elif defined(__riscv_misaligned_fast) && !defined(__riscv_vector)
+    uint8_t a[16], b[16];
+    ZXC_MEMCPY(a, src, 16);
+    ZXC_MEMCPY(b, (const uint8_t*)src + 16, 16);
+    ZXC_MEMCPY(dst, a, 16);
+    ZXC_MEMCPY((uint8_t*)dst + 16, b, 16);
 #else
     ZXC_MEMCPY(dst, src, 32);
 #endif
@@ -1666,15 +1701,15 @@ static ZXC_ALWAYS_INLINE uint64_t zxc_seek_block_count(const uint64_t total_deco
  * @param[in] len Length of the data in bytes.
  * @param[in] seed 0, a previous 32-bit checksum (zero-extended), or a block index.
  * @param[in] hash_method Checksum algorithm identifier (e.g., ZXC_CHECKSUM_RAPIDHASH).
- * @return The calculated 32-bit hash value.
+ * @return The 64-bit hash folded to 32 bits.
  */
-static ZXC_ALWAYS_INLINE uint32_t zxc_checksum(const void* RESTRICT input, const size_t len,
-                                               const uint64_t seed, const uint8_t hash_method) {
-    (void)hash_method; /* single algorithm for now; extend when adding more */
-    const uint64_t hash = rapidhash_withSeed(input, len, seed);
-
-    return (uint32_t)(hash ^ (hash >> (sizeof(uint32_t) * CHAR_BIT)));
-}
+// One copy per variant (zxc_checksum.c); a unit outside the variants gets _default.
+#ifdef ZXC_FUNCTION_SUFFIX
+#define zxc_checksum ZXC_PRIMARY_CAT(zxc_checksum, ZXC_FUNCTION_SUFFIX)
+#else
+#define zxc_checksum zxc_checksum_default
+#endif
+uint32_t zxc_checksum(const void* RESTRICT input, size_t len, uint64_t seed, uint8_t hash_method);
 
 /**
  * @brief Folds a data block's 32-bit checksum into the running archive digest.
@@ -1980,6 +2015,8 @@ typedef struct {
     size_t opt_scratch_cap;         /**< Current capacity of opt_scratch in bytes. */
     int checksum_enabled;           /**< 1 if checksum calculation/verification is enabled. */
     int compression_level;          /**< Compression level. */
+    uint8_t split_budget_pct;       /**< ZXC_C_FAVOR_DECODE_SPEED: growth budget in
+                                         percent, 0 = off. */
     size_t dict_size;               /**< Dictionary prefill size (0 = no dictionary). */
     uint8_t* dict_buffer;           /**< [dict | data] concat scratch carved from memory_block
                                          when dict_size > 0 (NULL otherwise). */
@@ -2196,14 +2233,16 @@ typedef struct {
  * @param[in]  dst_capacity  Total capacity of @p dst in bytes.
  * @param[in]  chunk_size    Block size to encode in the header.
  * @param[in]  has_checksum  Non-zero if the checksum bit must be set.
- * @param[in]  dict_id       Dictionary ID (0 = no dictionary).
+ * @param[in]  has_dict      Non-zero if the archive needs a dictionary.
+ * @param[in]  dict_id       Dictionary ID, stored when @p has_dict.
  * @param[in]  has_seek      Non-zero if the archive will carry a SEK block.
  *
  * @return Number of bytes written (@c ZXC_FILE_HEADER_SIZE) on success,
  *         or @c ZXC_ERROR_DST_TOO_SMALL if @p dst_capacity is insufficient.
  */
 int zxc_write_file_header(uint8_t* RESTRICT dst, const size_t dst_capacity, const size_t chunk_size,
-                          const int has_checksum, const uint32_t dict_id, const int has_seek);
+                          const int has_checksum, const int has_dict, const uint32_t dict_id,
+                          const int has_seek);
 
 /**
  * @brief Validates and reads the ZXC file header from @p src.
@@ -2217,8 +2256,10 @@ int zxc_write_file_header(uint8_t* RESTRICT dst, const size_t dst_capacity, cons
  *                               block size. May be @c NULL.
  * @param[out] out_has_checksum  Optional pointer that receives the checksum
  *                               flag. May be @c NULL.
+ * @param[out] out_has_dict      Optional pointer that receives the dictionary
+ *                               flag. May be @c NULL.
  * @param[out] out_dict_id       Optional pointer that receives the dictionary
- *                               ID (0 if none). May be @c NULL.
+ *                               ID, 0 when the flag is clear. May be @c NULL.
  * @param[out] out_has_seek      Optional pointer that receives the seek-table
  *                               flag. May be @c NULL.
  *
@@ -2227,14 +2268,15 @@ int zxc_write_file_header(uint8_t* RESTRICT dst, const size_t dst_capacity, cons
  *         @c ZXC_ERROR_BAD_VERSION).
  */
 int zxc_read_file_header(const uint8_t* RESTRICT src, const size_t src_size, size_t* out_block_size,
-                         int* out_has_checksum, uint32_t* out_dict_id, int* out_has_seek);
+                         int* out_has_checksum, int* out_has_dict, uint32_t* out_dict_id,
+                         int* out_has_seek);
 
 /** @brief The verdict on @p n bytes too short for a frame: the header speaks first,
  *  then @ref ZXC_ERROR_SRC_TOO_SMALL. */
 static inline int zxc_short_input_verdict(const uint8_t* p, const size_t n) {
     size_t chunk = 0;
     const int rc = zxc_read_file_header(p, n < ZXC_FILE_HEADER_SIZE ? n : ZXC_FILE_HEADER_SIZE,
-                                        &chunk, NULL, NULL, NULL);
+                                        &chunk, NULL, NULL, NULL, NULL);
     return rc != ZXC_OK ? rc : ZXC_ERROR_SRC_TOO_SMALL;
 }
 
@@ -2265,10 +2307,9 @@ static ZXC_ALWAYS_INLINE zxc_scan_src_t zxc_scan_src_mem(const uint8_t* data, co
 
 /** @brief What @ref zxc_scan_container learns about a container. */
 typedef struct {
-    uint64_t dsize;         /**< Sum of the stored decompressed sizes. */
-    uint64_t frames;        /**< ZXC frames. */
-    uint32_t first_dict_id; /**< Dictionary id of the first frame, 0 without one. */
-    int uses_dict;          /**< A frame bound to a dictionary. */
+    uint64_t dsize;  /**< Sum of the stored decompressed sizes. */
+    uint64_t frames; /**< ZXC frames. */
+    int uses_dict;   /**< A frame bound to a dictionary. */
 } zxc_container_info_t;
 
 /**
@@ -2292,10 +2333,11 @@ int zxc_container_next(const zxc_scan_src_t* src, uint64_t pos);
  * @param[out] start Offset of the frame's header.
  * @param[out] info  Its header and footer, checked like zxc_get_frame_info().
  * @param[out] footer_len Footer bytes, digest included; may be NULL.
+ * @param[out] has_dict   The header's dictionary flag; may be NULL.
  * @return @ref ZXC_OK, or a negative @ref zxc_error_t.
  */
 int zxc_scan_frame(const zxc_scan_src_t* src, uint64_t end, uint64_t* start, zxc_frame_info_t* info,
-                   size_t* footer_len);
+                   size_t* footer_len, int* has_dict);
 
 /**
  * @brief The frame that must span all of @p src: zxc_get_frame_info() and its
@@ -2465,10 +2507,11 @@ static inline size_t zxc_frame_tail_len(const uint64_t total) {
  * @param[in]  total      Bytes of the whole input.
  * @param[out] info       Filled on success.
  * @param[out] footer_len Footer bytes, digest included; may be NULL.
+ * @param[out] has_dict   The header's dictionary flag; may be NULL.
  * @return @ref ZXC_OK, or a negative @ref zxc_error_t.
  */
 int zxc_read_frame_info(const uint8_t* header, const uint8_t* tail, size_t tail_len, uint64_t total,
-                        zxc_frame_info_t* info, size_t* footer_len);
+                        zxc_frame_info_t* info, size_t* footer_len, int* has_dict);
 
 /** @brief Copies the fields of @p got that fit the caller's @p info_size bytes. */
 static ZXC_ALWAYS_INLINE void zxc_frame_info_copy(zxc_frame_info_t* info, const size_t info_size,

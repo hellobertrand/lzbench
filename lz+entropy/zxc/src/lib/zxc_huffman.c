@@ -50,26 +50,20 @@
 #define zxc_huf_decode_section_dict ZXC_CAT(zxc_huf_decode_section_dict, ZXC_FUNCTION_SUFFIX)
 #endif
 
-// Mark the primary variant (only _default, or a no-suffix build) so ISA-
-// independent cold code compiles once, not in every per-ISA copy. Keyed off the
-// suffix value, so every build gets it with no extra flag.
-#ifdef ZXC_FUNCTION_SUFFIX
-#define ZXC_PRIMARY__default 1
-#define ZXC_PRIMARY__avx2 0
-#define ZXC_PRIMARY__avx512 0
-#define ZXC_PRIMARY__neon32 0
-#define ZXC_PRIMARY_CAT_(a, b) a##b
-#define ZXC_PRIMARY_CAT(a, b) ZXC_PRIMARY_CAT_(a, b)
-#if ZXC_PRIMARY_CAT(ZXC_PRIMARY_, ZXC_FUNCTION_SUFFIX)
-#define ZXC_VARIANT_PRIMARY 1
-#endif
-#else
-#define ZXC_VARIANT_PRIMARY 1
-#endif
-
 #include "../../include/zxc_error.h"
 #include "zxc_internal.h"
 #include "zxc_pivco_tables.h"
+
+// SIMD variants drop the roles bound to _default; the primary copy keeps all.
+#if !defined(ZXC_VARIANT_PRIMARY) && defined(ZXC_ENCODER_DEFAULT)
+#define ZXC_HUF_NO_ENCODER
+#endif
+#if !defined(ZXC_VARIANT_PRIMARY) && defined(ZXC_ENTROPY_DECODER_DEFAULT)
+#define ZXC_HUF_NO_DECODER
+#endif
+#if !defined(ZXC_VARIANT_PRIMARY) && defined(ZXC_NO_DICT)
+#define ZXC_HUF_NO_DICT_SECTIONS
+#endif
 
 // ===========================================================================
 // Length-limited Huffman: boundary package-merge
@@ -82,6 +76,7 @@
 // ZXC_HUF_MAX_CODE_LEN_ULTRA gives the appearance count of each leaf, which is
 // its code length.
 
+#ifndef ZXC_HUF_NO_ENCODER
 typedef zxc_huf_pm_item_t pm_item_t;
 
 typedef zxc_huf_pm_leaf_t pm_leaf_t;
@@ -941,11 +936,13 @@ int zxc_huf_nudge_code_lengths(const uint32_t* RESTRICT freq, uint8_t* RESTRICT 
     return best >= 0;
 }
 #endif /* ZXC_VARIANT_PRIMARY */
+#endif /* !ZXC_HUF_NO_ENCODER */
 
 // ===========================================================================
 // 128-byte length header: 256 x 4-bit lengths, low nibble first.
 // =========================================================================
 
+#ifndef ZXC_HUF_NO_ENCODER
 void zxc_huf_pack_lengths(const uint8_t* RESTRICT code_len, uint8_t* RESTRICT out) {
     for (int i = 0; i < ZXC_HUF_NUM_SYMBOLS; i += 2) {
         const uint8_t lo = code_len[i] & 0x0F;
@@ -953,6 +950,8 @@ void zxc_huf_pack_lengths(const uint8_t* RESTRICT code_len, uint8_t* RESTRICT ou
         out[i >> 1] = (uint8_t)(lo | (hi << 4));
     }
 }
+
+#endif /* !ZXC_HUF_NO_ENCODER */
 
 int zxc_huf_unpack_lengths(const uint8_t* RESTRICT in, uint8_t* RESTRICT code_len) {
     int max_len = 0;
@@ -1004,6 +1003,7 @@ int zxc_huf_unpack_lengths(const uint8_t* RESTRICT in, uint8_t* RESTRICT code_le
 // ZXC_PAD_SIZE on dst (already true for lit/token buffers), and
 // ZXC_PIVCO_SCRATCH_PAD on scratch.
 
+#if !defined(ZXC_HUF_NO_ENCODER) || !defined(ZXC_HUF_NO_DECODER)
 static ZXC_ALWAYS_INLINE int zxc_pivco_popcnt32(const uint32_t v) { return (int)ZXC_POPCOUNT32(v); }
 
 static ZXC_ALWAYS_INLINE int zxc_pivco_popcnt64(const uint64_t v) { return (int)ZXC_POPCOUNT64(v); }
@@ -1125,7 +1125,9 @@ static int zxc_pivco_tree_build(const uint8_t* RESTRICT code_len, zxc_pivco_tree
     }
     return 0;
 }
+#endif
 
+#ifndef ZXC_HUF_NO_ENCODER
 /**
  * @brief Per-node symbol counts from the histogram (encoder / size estimate).
  *
@@ -1152,7 +1154,9 @@ static void zxc_pivco_codes(const zxc_pivco_tree_t* RESTRICT t, uint32_t* RESTRI
         for (int i = 0; i < zxc_pivco_leaves(t, d); i++)
             codes[t->syms[t->leaf_base[d] + i]] = (uint32_t)(t->node_base[d] + i - t->base[d]);
 }
+#endif /* !ZXC_HUF_NO_ENCODER */
 
+#if !defined(ZXC_HUF_NO_ENCODER) || !defined(ZXC_HUF_NO_DECODER)
 /**
  * @brief Byte size of one PivCo node's on-wire bit run.
  *
@@ -1178,7 +1182,9 @@ static void zxc_pivco_codes(const zxc_pivco_tree_t* RESTRICT t, uint32_t* RESTRI
 static ZXC_ALWAYS_INLINE size_t zxc_pivco_run_bytes(const uint32_t count, const uint8_t flat_d) {
     return flat_d ? ((size_t)count * flat_d + 7) / 8 : ((size_t)count + 7) / 8;
 }
+#endif
 
+#ifndef ZXC_HUF_NO_ENCODER
 /**
  * @brief Payload size, and each run's first bit as a cursor if @p cur is set.
  *
@@ -1314,6 +1320,7 @@ int zxc_huf_encode_section(const uint8_t* RESTRICT literals, const size_t n_lite
     return zxc_pivco_encode_core(literals, n_literals, freq, code_len, &t, codes, dst, dst_cap, 1);
 }
 
+#ifndef ZXC_HUF_NO_DICT_SECTIONS
 /**
  * @brief Encode a literal section against a shared dictionary table.
  *
@@ -1330,6 +1337,8 @@ int zxc_huf_encode_section_dict(const uint8_t* RESTRICT literals, const size_t n
     return zxc_pivco_encode_core(literals, n_literals, freq, code_len, tree, codes, dst, dst_cap,
                                  0);
 }
+#endif /* !ZXC_HUF_NO_DICT_SECTIONS */
+#endif /* !ZXC_HUF_NO_ENCODER */
 
 // ISA-independent cold dict setup
 #if defined(ZXC_VARIANT_PRIMARY)
@@ -1350,6 +1359,7 @@ int zxc_huf_dict_tree_build(const uint8_t* RESTRICT packed_lengths, zxc_pivco_tr
 }
 #endif /* ZXC_VARIANT_PRIMARY */
 
+#ifndef ZXC_HUF_NO_DECODER
 /**
  * @brief Advances the merge cursors past one fixed-width step.
  *
@@ -1363,6 +1373,21 @@ int zxc_huf_dict_tree_build(const uint8_t* RESTRICT packed_lengths, zxc_pivco_tr
         lp += (size_t)((w) - (pc)); \
         i += (w);                   \
     } while (0)
+
+#if defined(ZXC_USE_NEON64) && !defined(__ARM_FEATURE_CSSC)
+// Before FEAT_CSSC, AArch64 counts bits through a vector register: four
+// instructions per byte in the merge loop, against one load from here.
+#define ZXC_PC2(n) (n), (n) + 1, (n) + 1, (n) + 2
+#define ZXC_PC4(n) ZXC_PC2(n), ZXC_PC2((n) + 1), ZXC_PC2((n) + 1), ZXC_PC2((n) + 2)
+#define ZXC_PC6(n) ZXC_PC4(n), ZXC_PC4((n) + 1), ZXC_PC4((n) + 1), ZXC_PC4((n) + 2)
+static const uint8_t zxc_pivco_popcnt8_tab[256] = {ZXC_PC6(0), ZXC_PC6(1), ZXC_PC6(1), ZXC_PC6(2)};
+#undef ZXC_PC6
+#undef ZXC_PC4
+#undef ZXC_PC2
+#define ZXC_PIVCO_POPCNT8(b) ((int)zxc_pivco_popcnt8_tab[b])
+#elif defined(ZXC_USE_NEON64)
+#define ZXC_PIVCO_POPCNT8(b) zxc_pivco_popcnt32(b)
+#endif
 
 /**
  * @brief Merge two adjacent child sequences under control bits.
@@ -1382,6 +1407,8 @@ static ZXC_ALWAYS_INLINE void zxc_pivco_merge(uint8_t* RESTRICT out, const uint8
     size_t i = 0;
     size_t lp = 0;
     size_t rp = 0;
+    // MSan keeps the shadow of the bytes a shuffle loads but never selects.
+    ZXC_MSAN_UNPOISON(src + n, 16);
 #if defined(ZXC_USE_NEON64)
     // 16 outputs per step: two-register TBL over {L[0..15], R[0..15]} with the
     // signed-index tables (see zxc_pivco_tables.h).
@@ -1391,11 +1418,11 @@ static ZXC_ALWAYS_INLINE void zxc_pivco_merge(uint8_t* RESTRICT out, const uint8
         uint8x16x2_t tb;
         tb.val[0] = vld1q_u8(L + lp);
         tb.val[1] = vld1q_u8(R + rp);
-        const int pc0 = zxc_pivco_popcnt32(b0);
+        const size_t pc0 = (size_t)ZXC_PIVCO_POPCNT8(b0);
         const uint8x8_t ia = vld1_u8(zxc_pivco_idxa_u8[b0]);
         const uint8x8_t ib = vld1_u8(zxc_pivco_idxb_pre[pc0][b1]);
         vst1q_u8(out + i, vqtbl2q_u8(tb, vcombine_u8(ia, ib)));
-        const int pc = pc0 + zxc_pivco_popcnt32(b1);
+        const size_t pc = pc0 + (size_t)ZXC_PIVCO_POPCNT8(b1);
         ZXC_PIVCO_MERGE_STEP(16, pc);
     }
 #else /* x86 tiers */
@@ -1429,12 +1456,12 @@ static ZXC_ALWAYS_INLINE void zxc_pivco_merge(uint8_t* RESTRICT out, const uint8
     // second cursor is lp + (16 - pcA), never lp + 16.
     while (i + 32 <= n) {
         const uint8_t* cb = bits + (i >> 3);
-        const int pcA0 = zxc_pivco_popcnt32(cb[0]);
-        const int pcA = pcA0 + zxc_pivco_popcnt32(cb[1]);
-        const int pcB0 = zxc_pivco_popcnt32(cb[2]);
-        const int pcB = pcB0 + zxc_pivco_popcnt32(cb[3]);
-        const size_t lpB = lp + (size_t)(16 - pcA);
-        const size_t rpB = rp + (size_t)pcA;
+        const size_t pcA0 = (size_t)zxc_pivco_popcnt32(cb[0]);
+        const size_t pcA = pcA0 + (size_t)zxc_pivco_popcnt32(cb[1]);
+        const size_t pcB0 = (size_t)zxc_pivco_popcnt32(cb[2]);
+        const size_t pcB = pcB0 + (size_t)zxc_pivco_popcnt32(cb[3]);
+        const size_t lpB = lp + (16 - pcA);
+        const size_t rpB = rp + pcA;
         const __m256i vl = _mm256_inserti128_si256(
             _mm256_castsi128_si256(_mm_loadu_si128((const __m128i*)(const void*)(L + lp))),
             _mm_loadu_si128((const __m128i*)(const void*)(L + lpB)), 1);
@@ -1452,19 +1479,19 @@ static ZXC_ALWAYS_INLINE void zxc_pivco_merge(uint8_t* RESTRICT out, const uint8
             (__m256i*)(void*)(out + i),
             _mm256_blendv_epi8(_mm256_shuffle_epi8(vl, ix), _mm256_shuffle_epi8(vr, ix),
                                _mm256_slli_epi16(ix, 3)));
-        lp = lpB + (size_t)(16 - pcB);
-        rp = rpB + (size_t)pcB;
+        lp = lpB + (16 - pcB);
+        rp = rpB + pcB;
         i += 32;
     }
 #else
     while (i + 32 <= n) {
         const uint8_t* cb = bits + (i >> 3);
-        const int pcA0 = zxc_pivco_popcnt32(cb[0]);
-        const int pcA = pcA0 + zxc_pivco_popcnt32(cb[1]);
-        const int pcB0 = zxc_pivco_popcnt32(cb[2]);
-        const int pcB = pcB0 + zxc_pivco_popcnt32(cb[3]);
-        const size_t lpB = lp + (size_t)(16 - pcA);
-        const size_t rpB = rp + (size_t)pcA;
+        const size_t pcA0 = (size_t)zxc_pivco_popcnt32(cb[0]);
+        const size_t pcA = pcA0 + (size_t)zxc_pivco_popcnt32(cb[1]);
+        const size_t pcB0 = (size_t)zxc_pivco_popcnt32(cb[2]);
+        const size_t pcB = pcB0 + (size_t)zxc_pivco_popcnt32(cb[3]);
+        const size_t lpB = lp + (16 - pcA);
+        const size_t rpB = rp + pcA;
         const __m128i vlA = _mm_loadu_si128((const __m128i*)(const void*)(L + lp));
         const __m128i vrA = _mm_loadu_si128((const __m128i*)(const void*)(R + rp));
         const __m128i vlB = _mm_loadu_si128((const __m128i*)(const void*)(L + lpB));
@@ -1485,8 +1512,8 @@ static ZXC_ALWAYS_INLINE void zxc_pivco_merge(uint8_t* RESTRICT out, const uint8
                          _mm_shuffle_epi8(vrB, _mm_sub_epi8(ixB, _mm_set1_epi8(16))));
         _mm_storeu_si128((__m128i*)(void*)(out + i), selA);
         _mm_storeu_si128((__m128i*)(void*)(out + i + 16), selB);
-        lp = lpB + (size_t)(16 - pcB);
-        rp = rpB + (size_t)pcB;
+        lp = lpB + (16 - pcB);
+        rp = rpB + pcB;
         i += 32;
     }
 #endif
@@ -1543,6 +1570,7 @@ static ZXC_ALWAYS_INLINE void zxc_pivco_merge(uint8_t* RESTRICT out, const uint8
 }
 
 #undef ZXC_PIVCO_MERGE_STEP
+#undef ZXC_PIVCO_POPCNT8
 
 /**
  * @brief Decode a flat subtree's packed D-bit code run into symbols.
@@ -2290,6 +2318,7 @@ int zxc_huf_decode_section(const uint8_t* RESTRICT payload, const size_t payload
                                  dst, n, &t, scratch);
 }
 
+#ifndef ZXC_HUF_NO_DICT_SECTIONS
 /**
  * @brief Decode a shared-dictionary literal section (no inline header).
  *
@@ -2302,3 +2331,5 @@ int zxc_huf_decode_section_dict(const uint8_t* RESTRICT payload, const size_t pa
                                 const zxc_pivco_tree_t* RESTRICT tree, uint8_t* RESTRICT scratch) {
     return zxc_pivco_decode_core(payload, payload_size, dst, n, tree, scratch);
 }
+#endif /* !ZXC_HUF_NO_DICT_SECTIONS */
+#endif /* !ZXC_HUF_NO_DECODER */

@@ -34,6 +34,9 @@
 #include "../../include/zxc_error.h"
 #include "zxc_internal.h"
 
+// Never dispatched (universal builds).
+#if defined(ZXC_VARIANT_PRIMARY) || !defined(ZXC_ENCODER_DEFAULT)
+
 /**
  * @brief Computes a hash value for either a 4-byte or 5-byte sequence.
  *
@@ -53,6 +56,18 @@ static ZXC_ALWAYS_INLINE uint32_t zxc_hash_func(const uint64_t val, const int us
 }
 
 /**
+ * @brief Which hash a level uses: the single definition, so that a hash computed
+ *        by a parse loop and the one the match finder needs are the same function.
+ */
+static ZXC_ALWAYS_INLINE int zxc_lz77_use_hash5(const int level) {
+    return level >= ZXC_LEVEL_DEFAULT;
+}
+
+// The parse loops read 8 bytes at any position up to search_limit, inclusive.
+static_assert(ZXC_LZ_SEARCH_MARGIN >= sizeof(uint64_t),
+              "search_limit must leave a full 8-byte read before the block end");
+
+/**
  * @brief 8-bit rejection tag: XOR fold of the first four bytes at a position.
  *
  * One tag per hash slot, so a mismatching head is rejected without touching the
@@ -70,7 +85,10 @@ static ZXC_ALWAYS_INLINE uint8_t zxc_hash_tag(const uint32_t val4) {
  */
 static ZXC_ALWAYS_INLINE uint32_t zxc_epoch_pos(const uint32_t head, const uint32_t offset_mask,
                                                 const uint32_t epoch_mark) {
-    return ((head & ~offset_mask) == epoch_mark) ? (head & offset_mask) : 0;
+    // epoch_mark has no position bits: the XOR is the position when the epochs
+    // agree, above offset_mask otherwise. No ~offset_mask to keep live.
+    const uint32_t pos = head ^ epoch_mark;
+    return (pos <= offset_mask) ? pos : 0;
 }
 
 /**
@@ -299,6 +317,11 @@ static ZXC_ALWAYS_INLINE uint32_t zxc_spl_match_split_piece(const uint32_t code)
     return (rest < ZXC_SPL_INLINE_ML_CODE) ? rest : ZXC_SPL_INLINE_ML_CODE;
 }
 
+/** @brief Whether favor_decode_speed may split a match at biased offset @p off. */
+static ZXC_ALWAYS_INLINE int zxc_spl_match_split_far(const uint16_t off) {
+    return (uint32_t)off + ZXC_LZ_OFFSET_BIAS >= ZXC_SPL_MATCH_SPLIT_MIN_OFFSET;
+}
+
 /**
  * @brief Predictability of the block's ML-escape branch, for the split decision.
  *
@@ -308,8 +331,7 @@ static ZXC_ALWAYS_INLINE uint32_t zxc_spl_match_split_piece(const uint32_t code)
  * lanes keep an inline run off one store-forwarding chain.
  *
  * @return 1 when the minority counts, a static predictor's misses, reach
- *         ZXC_SPL_MATCH_SPLIT_MIN_MISPREDICT_PCT of the escapes and some escape sits
- *         in a bad context, so that a split can happen; else 0.
+ *         ZXC_SPL_MATCH_SPLIT_MIN_MISPREDICT_PCT of the escapes; else 0.
  */
 static int zxc_spl_match_split_analyze(const uint8_t* RESTRICT tokens, const uint32_t n_seq,
                                        zxc_spl_match_split_hist_t* RESTRICT hist_buf,
@@ -330,7 +352,8 @@ static int zxc_spl_match_split_analyze(const uint8_t* RESTRICT tokens, const uin
         hist = ((hist << 1) | esc) & hmask;
         n_esc += esc;
     }
-    uint32_t errors = 0, bad_esc = 0;
+    // No conditional sum here: GCC 14.2 miscompiles it for AVX-512
+    uint32_t errors = 0;
     for (uint32_t c = 0; c <= hmask; c++) {
         uint32_t n0 = 0, n1 = 0;
         for (uint32_t l = 0; l < 4; l++) {
@@ -338,23 +361,76 @@ static int zxc_spl_match_split_analyze(const uint8_t* RESTRICT tokens, const uin
             n1 += ctx_hist[l][1][c];
         }
         ctx_bad[c] = (n1 < n0);  // escape a strict minority in its context
-        bad_esc += ctx_bad[c] ? n1 : 0;
         errors += (n0 < n1) ? n0 : n1;
     }
-    return bad_esc != 0 &&
+    return n_esc != 0 &&
            (uint64_t)errors * 100 >= (uint64_t)ZXC_SPL_MATCH_SPLIT_MIN_MISPREDICT_PCT * n_esc;
+}
+
+/**
+ * @brief The longest length code whose escapes, shortest first, all fit the
+ *        block's growth budget.
+ *
+ * Every escape is worth removing (about 20 cycles taken, a piece about 4), so
+ * only size bounds the split: @p budget_pct percent of the block's size before
+ * entropy coding. A split match trades its 1-byte varint for pieces - 1
+ * sequences.
+ *
+ * @param[in]  tokens     The block's tokens.
+ * @param[in]  offsets    Its offsets, biased.
+ * @param[in]  extras     Its extras.
+ * @param[in]  extras_sz  Bytes used in @p extras.
+ * @param[in]  n_seq      Sequence count.
+ * @param[in]  lit_c      Literal bytes.
+ * @param[in]  off_bytes  Bytes per offset on the wire, 1 or 2.
+ * @param[out] hist       Scratch, ZXC_SPL_MATCH_SPLIT_MAX + 1 counters.
+ * @param[in]  budget_pct zxc_cctx_t::split_budget_pct, non-zero.
+ * @return The cap, at most ZXC_SPL_MATCH_SPLIT_MAX; ZXC_SPL_INLINE_ML_CODE
+ *         when nothing fits.
+ */
+static uint32_t zxc_spl_match_split_budget_cap(const uint8_t* RESTRICT tokens,
+                                               const uint16_t* RESTRICT offsets,
+                                               const uint8_t* RESTRICT extras,
+                                               const size_t extras_sz, const uint32_t n_seq,
+                                               const size_t lit_c, const size_t off_bytes,
+                                               uint32_t* RESTRICT hist, const uint32_t budget_pct) {
+    const uint8_t* const extras_end = extras + extras_sz;
+    ZXC_MEMSET(hist, 0, (ZXC_SPL_MATCH_SPLIT_MAX + 1) * sizeof(uint32_t));
+    const uint8_t* p = extras;
+    for (uint32_t i = 0; i < n_seq; i++) {
+        const uint8_t tok = tokens[i];
+        if ((tok >> ZXC_TOKEN_LIT_BITS) == ZXC_TOKEN_LL_MASK) (void)zxc_read_varint(&p, extras_end);
+        if ((tok & ZXC_TOKEN_ML_MASK) != ZXC_TOKEN_ML_MASK) continue;
+        const uint32_t code = zxc_read_varint(&p, extras_end) + ZXC_TOKEN_ML_MASK;
+        if (code <= ZXC_SPL_MATCH_SPLIT_MAX && zxc_spl_match_split_far(offsets[i])) hist[code]++;
+    }
+    const size_t seq_bytes = 1 + off_bytes;
+    size_t budget = (n_seq * seq_bytes + extras_sz + lit_c) * budget_pct / 100;
+    uint32_t cap = ZXC_SPL_INLINE_ML_CODE;
+    for (uint32_t c = ZXC_TOKEN_ML_MASK; c <= ZXC_SPL_MATCH_SPLIT_MAX; c++) {
+        if (hist[c] == 0) continue;
+        const size_t cost = hist[c] * ((zxc_spl_match_split_pieces(c) - 1) * seq_bytes - 1);
+        if (cost > budget) break;
+        budget -= cost;
+        cap = c;
+    }
+    return cap;
 }
 
 /**
  * @brief Per-block match splitting: escaped matches re-emitted as inline pieces.
  *
- * A match whose length code exceeds the inline reach but not @p cap becomes a
+ * A match whose length code exceeds the inline reach but not a cap becomes a
  * chain of inline matches at the same offset: the decoder never takes its ML
  * escape. Each extra piece costs a token and an offset, less the varint it
  * replaces.
  *
- * Two gates (zxc_spl_match_split_analyze): the block must look mispredicted, which
+ * A match splits under either cap. @p gate_max has two gates
+ * (zxc_spl_match_split_analyze): the block must look mispredicted, which
  * leaves regular data whole, then only escapes of mispredicted contexts split.
+ * With @p budget_pct, every escape at an offset of at least
+ * ZXC_SPL_MATCH_SPLIT_MIN_OFFSET splits up to the budget's cap
+ * (zxc_spl_match_split_budget_cap), so the option never splits less.
  *
  * In place: pass 1 turns @p side from each sequence's context into its length
  * code to split (0 = keep) and compacts the kept extras forward; pass 2 expands
@@ -369,33 +445,47 @@ static int zxc_spl_match_split_analyze(const uint8_t* RESTRICT tokens, const uin
  * @param[out]    side      Scratch, one byte per sequence (zxc_cctx_t::buf_split).
  * @param[out]    hist_buf  Scratch (zxc_cctx_t::buf_split_hist).
  * @param[in]     n_seq     Sequence count of the block.
- * @param[in]     cap       zxc_lz77_params_t::split_max.
+ * @param[in]     lit_c     Its literal bytes.
+ * @param[in]     off_bytes Bytes per offset on the wire, 1 or 2.
+ * @param[in]     gate_max  zxc_lz77_params_t::split_max.
+ * @param[in]     budget_pct zxc_cctx_t::split_budget_pct; 0 = none.
  * @return The new sequence count (unchanged when the block is not split).
  */
 static uint32_t zxc_spl_match_split_block(uint8_t* RESTRICT tokens, uint16_t* RESTRICT offsets,
                                           uint8_t* RESTRICT extras, size_t* RESTRICT extras_sz,
                                           uint8_t* RESTRICT side,
                                           zxc_spl_match_split_hist_t* RESTRICT hist_buf,
-                                          const uint32_t n_seq, const uint8_t cap) {
-    if (cap <= ZXC_SPL_INLINE_ML_CODE || n_seq == 0) return n_seq;
-    uint8_t ctx_bad[1U << ZXC_SPL_MATCH_SPLIT_CTX_BITS];
-    if (!zxc_spl_match_split_analyze(tokens, n_seq, hist_buf, ctx_bad, side)) return n_seq;
-
-    // 1. Mark the matches to split (bad context, within the cap) and drop their
-    // varints; the other extras move forward.
+                                          const uint32_t n_seq, const size_t lit_c,
+                                          const size_t off_bytes, const uint8_t gate_max,
+                                          const uint8_t budget_pct) {
+    if (n_seq == 0) return n_seq;
     const uint8_t* const extras_end = extras + *extras_sz;
+    uint8_t ctx_bad[1U << ZXC_SPL_MATCH_SPLIT_CTX_BITS];
+
+    // 0. The caps: the budget's, then the gate's (same scratch, in turn).
+    uint32_t all_cap = ZXC_SPL_INLINE_ML_CODE, gate_cap = ZXC_SPL_INLINE_ML_CODE;
+    if (budget_pct)
+        all_cap = zxc_spl_match_split_budget_cap(tokens, offsets, extras, *extras_sz, n_seq, lit_c,
+                                                 off_bytes, (*hist_buf)[0][0], budget_pct);
+    if (gate_max > ZXC_SPL_INLINE_ML_CODE &&
+        zxc_spl_match_split_analyze(tokens, n_seq, hist_buf, ctx_bad, side))
+        gate_cap = gate_max;
+    if (all_cap == ZXC_SPL_INLINE_ML_CODE && gate_cap == ZXC_SPL_INLINE_ML_CODE) return n_seq;
+
+    // 1. Mark the matches to split and drop their varints; the other extras
+    // move forward.
     size_t r = 0, w = 0;
     uint32_t extra = 0;
     for (uint32_t i = 0; i < n_seq; i++) {
         const uint8_t tok = tokens[i];
-        const int bad = ctx_bad[side[i]];
+        const int bad = gate_cap != ZXC_SPL_INLINE_ML_CODE && ctx_bad[side[i]];
         side[i] = 0;
         if ((tok >> ZXC_TOKEN_LIT_BITS) == ZXC_TOKEN_LL_MASK)
             zxc_varint_keep(extras, &w, &r, extras_end);
         if ((tok & ZXC_TOKEN_ML_MASK) != ZXC_TOKEN_ML_MASK) continue;
         const uint8_t* p = extras + r;
         const uint32_t code = zxc_read_varint(&p, extras_end) + ZXC_TOKEN_ML_MASK;
-        if (bad && code <= cap) {
+        if ((code <= all_cap && zxc_spl_match_split_far(offsets[i])) || (bad && code <= gate_cap)) {
             side[i] = (uint8_t)code;
             extra += zxc_spl_match_split_pieces(code) - 1;
             r = (size_t)(p - extras);
@@ -550,6 +640,7 @@ static ZXC_ALWAYS_INLINE int zxc_lazy_probe(const uint8_t* src, const uint8_t* l
  *
  * @param[in] src Pointer to the start of the source buffer.
  * @param[in] ip Current input position pointer.
+ * @param[in] h Hash of the 8 bytes at @p ip, under zxc_lz77_use_hash5(@p level).
  * @param[in] iend Pointer to the end of the input buffer.
  * @param[in] search_limit Pointer to the match finding limit.
  * @param[in] anchor Pointer to the current anchor position.
@@ -567,17 +658,16 @@ static ZXC_ALWAYS_INLINE int zxc_lazy_probe(const uint8_t* src, const uint8_t* l
  *         (reference pointer, length of the match, and backtrack distance).
  */
 static ZXC_ALWAYS_INLINE zxc_match_t zxc_lz77_find_best_match(
-    const uint8_t* src, const uint8_t* ip, const uint8_t* iend, const uint8_t* search_limit,
-    const uint8_t* anchor, uint32_t* RESTRICT hash_table, uint8_t* RESTRICT hash_tags,
-    uint16_t* RESTRICT chain_table, const uint32_t epoch_mark, const uint32_t offset_mask,
-    const int level, const zxc_lz77_params_t p, const uint32_t last_off) {
-    const int use_hash5 = (level >= ZXC_LEVEL_DEFAULT);
+    const uint8_t* src, const uint8_t* ip, const uint32_t h, const uint8_t* iend,
+    const uint8_t* search_limit, const uint8_t* anchor, uint32_t* RESTRICT hash_table,
+    uint8_t* RESTRICT hash_tags, uint16_t* RESTRICT chain_table, const uint32_t epoch_mark,
+    const uint32_t offset_mask, const int level, const zxc_lz77_params_t p,
+    const uint32_t last_off) {
+    const int use_hash5 = zxc_lz77_use_hash5(level);
     // Sentinel length just below the minimum, so any valid match replaces it.
     zxc_match_t best = (zxc_match_t){NULL, ZXC_LZ_MIN_MATCH_LEN - 1, 0};
 
-    uint64_t cur_val8 = zxc_le64(ip);
-    uint32_t cur_val = (uint32_t)cur_val8;
-    uint32_t h = zxc_hash_func(cur_val8, use_hash5);
+    const uint32_t cur_val = zxc_le32(ip);
 
     // 8-bit tag: XOR fold of first 4 bytes for fast rejection
     const uint8_t cur_tag = zxc_hash_tag(cur_val);
@@ -593,11 +683,11 @@ static ZXC_ALWAYS_INLINE zxc_match_t zxc_lz77_find_best_match(
         match_idx = zxc_epoch_pos(hash_table[h], offset_mask, epoch_mark);
     }
 
-    // skip_head still drives the chain walk on level >= 3 (advances past the
-    // mismatched head without comparing). On level <= 2 it is always 0 here:
-    // either match_idx == 0 (filter-skip) or stored_tag == cur_tag.
+    // skip_head drives the chain walk on level >= 3 (advances past the
+    // mismatched head without comparing). On level <= 2 it is always 0, which
+    // the compiler cannot see: saying so frees registers in the PAK loop.
     // cppcheck-suppress bitwiseOnBoolean
-    const int skip_head = (match_idx != 0) & (stored_tag != cur_tag);
+    const int skip_head = (level > ZXC_LEVEL_FAST) & (match_idx != 0) & (stored_tag != cur_tag);
 
     // Split table writes
     hash_table[h] = epoch_mark | cur_pos;
@@ -1200,8 +1290,9 @@ static int zxc_lz77_optimal_parse_spl(zxc_cctx_t* RESTRICT ctx, const uint8_t* R
         // resolve against src.
         const uint8_t* ip = src_base + p;
         const zxc_match_t m = zxc_lz77_find_best_match(
-            src, ip, iend, search_limit, /*anchor=*/ip, hash_table, hash_tags, chain_table,
-            epoch_mark, offset_mask, level, lzp_opt, last_off);
+            src, ip, zxc_hash_func(zxc_le64(ip), zxc_lz77_use_hash5(level)), iend, search_limit,
+            /*anchor=*/ip, hash_table, hash_tags, chain_table, epoch_mark, offset_mask, level,
+            lzp_opt, last_off);
 
         if (m.ref) {
             const uint32_t off = (uint32_t)(ip - m.ref);
@@ -1367,7 +1458,7 @@ static void zxc_lz_seed_dict(const uint8_t* RESTRICT src, const size_t dict_size
                              const uint32_t offset_mask, const int level) {
     if (UNLIKELY(dict_size < ZXC_LZ_MIN_MATCH_LEN)) return;
 
-    const int use_hash5 = (level >= ZXC_LEVEL_DEFAULT);
+    const int use_hash5 = zxc_lz77_use_hash5(level);
     const size_t limit = dict_size - (ZXC_LZ_MIN_MATCH_LEN - 1);
 
     // Sparse seeding for the first half, dense for the second half.
@@ -1396,13 +1487,160 @@ static void zxc_lz_seed_dict(const uint8_t* RESTRICT src, const size_t dict_size
 }
 
 /**
+ * @brief Lazy parse of one SPL block (levels 3 to 5).
+ *
+ * @p level is a constant at each instantiation below: the parameter table and
+ * every level test in the match finder fold away, and the parse no longer shares
+ * a stack frame with the serialiser. Only @p min_offset, which depends on the
+ * block, stays a runtime value.
+ *
+ * @param[in,out] ctx            Compression context: hash and chain tables, buffers.
+ * @param[in]     src            Input, prefixed by the dictionary content when one is active.
+ * @param[in]     src_sz         Size of @p src, that prefix included.
+ * @param[in]     epoch_mark     Current epoch, shifted into the slot's epoch bits.
+ * @param[in]     min_offset     Shortest match distance the parser may emit.
+ * @param[out]    seq_c_out      Number of emitted sequences.
+ * @param[out]    lit_c_out      Number of literal bytes staged.
+ * @param[out]    extras_sz_out  Bytes written to the extras stream.
+ * @param[out]    max_offset_out Widest biased offset emitted.
+ * @param[in]     level          Compression level, a compile-time constant.
+ * @return @ref ZXC_OK, or @ref ZXC_ERROR_OVERFLOW; the outputs are set on success only.
+ */
+static ZXC_ALWAYS_INLINE int zxc_lz77_lazy_parse_spl_impl(
+    zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRICT src, const size_t src_sz,
+    const uint32_t epoch_mark, const uint32_t min_offset, uint32_t* RESTRICT seq_c_out,
+    size_t* RESTRICT lit_c_out, size_t* RESTRICT extras_sz_out, uint16_t* RESTRICT max_offset_out,
+    const int level) {
+    zxc_lz77_params_t lzp = zxc_get_lz77_params(level);
+    lzp.min_offset = min_offset;
+    const uint32_t offset_mask = ctx->offset_mask;
+
+    const uint8_t* ip = src + ctx->dict_size;
+    const uint8_t* iend = src + src_sz;
+    const uint8_t* anchor = ip;
+    const uint8_t* search_limit = iend - ZXC_LZ_SEARCH_MARGIN;
+
+    uint32_t* const hash_table = ctx->hash_table;
+    uint8_t* const hash_tags = ctx->hash_tags;
+    uint16_t* const chain_table = ctx->chain_table;
+    uint8_t* const literals = ctx->literals;
+    uint8_t* const buf_tokens = ctx->buf_tokens;
+    uint16_t* const buf_offsets = ctx->buf_offsets;
+    uint8_t* const buf_extras = ctx->buf_extras;
+
+    uint32_t seq_c = 0;
+    size_t lit_c = 0;
+    size_t extras_sz = 0;
+    uint16_t max_offset = 0;
+
+    const int use_hash5 = zxc_lz77_use_hash5(level);
+
+    while (LIKELY(ip < search_limit)) {
+        const size_t dist = (size_t)(ip - anchor);
+        size_t step = lzp.step_base + (dist >> lzp.step_shift);
+        if (UNLIKELY(ip + step >= search_limit)) step = 1;
+
+        // ip + step <= search_limit either way, so this read stays in the block.
+        // cppcheck-suppress unreadVariable
+        const uint32_t h_next = zxc_hash_func(zxc_le64(ip + step), use_hash5);
+        ZXC_PREFETCH_READ(&hash_tags[h_next]);
+        ZXC_PREFETCH_READ(&hash_table[h_next]);
+
+        const zxc_match_t m = zxc_lz77_find_best_match(
+            src, ip, zxc_hash_func(zxc_le64(ip), use_hash5), iend, search_limit, anchor, hash_table,
+            hash_tags, chain_table, epoch_mark, offset_mask, level, lzp,
+            /*last_off=*/0U);
+
+        if (m.ref) {
+            ip -= m.backtrack;
+            const uint32_t ll = (uint32_t)(ip - anchor);
+            const uint32_t ml = m.len - ZXC_LZ_MIN_MATCH_LEN;
+            const uint32_t off = (uint32_t)(ip - m.ref);
+            const uint16_t off_biased = (uint16_t)(off - ZXC_LZ_OFFSET_BIAS);
+
+            if (ll > 0) zxc_flush_literals(literals, &lit_c, anchor, ll, iend);
+
+            if (UNLIKELY(!zxc_spl_put_seq(buf_tokens, buf_offsets, buf_extras, &seq_c, &extras_sz,
+                                          &max_offset, ll, ml, off_biased)))
+                return ZXC_ERROR_OVERFLOW;
+
+            if (m.len > 2 && level > ZXC_LEVEL_BALANCED) {
+                const uint8_t* match_end = ip + m.len;
+                if (match_end < iend - 7) {
+                    const uint32_t pos_u = (uint32_t)((match_end - 2) - src);
+                    const uint64_t val_u8 = zxc_le64(match_end - 2);
+                    const uint32_t val_u = (uint32_t)val_u8;
+                    const uint32_t h_u = zxc_hash_func(val_u8, use_hash5);
+                    const uint32_t prev_idx =
+                        zxc_epoch_pos(hash_table[h_u], offset_mask, epoch_mark);
+                    hash_table[h_u] = epoch_mark | pos_u;
+                    hash_tags[h_u] = zxc_hash_tag(val_u);
+                    chain_table[pos_u & ZXC_LZ_WINDOW_MASK] = zxc_chain_delta(pos_u, prev_idx);
+                }
+            }
+
+            ip += m.len;
+            anchor = ip;
+        } else {
+            ip += step;
+        }
+    }
+
+    const size_t last_lits = (size_t)(iend - anchor);
+    if (last_lits > 0) {
+        ZXC_MEMCPY(literals + lit_c, anchor, last_lits);
+        lit_c += last_lits;
+    }
+
+    *seq_c_out = seq_c;
+    *lit_c_out = lit_c;
+    *extras_sz_out = extras_sz;
+    *max_offset_out = max_offset;
+    return ZXC_OK;
+}
+
+// One instance per lazy level, out of line: see zxc_lz77_lazy_parse_spl_impl().
+static ZXC_NOINLINE int zxc_lz77_lazy_parse_spl_l3(zxc_cctx_t* RESTRICT ctx,
+                                                   const uint8_t* RESTRICT src, const size_t src_sz,
+                                                   const uint32_t epoch_mark,
+                                                   const uint32_t min_offset, uint32_t* seq_c_out,
+                                                   size_t* lit_c_out, size_t* extras_sz_out,
+                                                   uint16_t* max_offset_out) {
+    return zxc_lz77_lazy_parse_spl_impl(ctx, src, src_sz, epoch_mark, min_offset, seq_c_out,
+                                        lit_c_out, extras_sz_out, max_offset_out,
+                                        ZXC_LEVEL_DEFAULT);
+}
+
+static ZXC_NOINLINE int zxc_lz77_lazy_parse_spl_l4(zxc_cctx_t* RESTRICT ctx,
+                                                   const uint8_t* RESTRICT src, const size_t src_sz,
+                                                   const uint32_t epoch_mark,
+                                                   const uint32_t min_offset, uint32_t* seq_c_out,
+                                                   size_t* lit_c_out, size_t* extras_sz_out,
+                                                   uint16_t* max_offset_out) {
+    return zxc_lz77_lazy_parse_spl_impl(ctx, src, src_sz, epoch_mark, min_offset, seq_c_out,
+                                        lit_c_out, extras_sz_out, max_offset_out,
+                                        ZXC_LEVEL_BALANCED);
+}
+
+static ZXC_NOINLINE int zxc_lz77_lazy_parse_spl_l5(zxc_cctx_t* RESTRICT ctx,
+                                                   const uint8_t* RESTRICT src, const size_t src_sz,
+                                                   const uint32_t epoch_mark,
+                                                   const uint32_t min_offset, uint32_t* seq_c_out,
+                                                   size_t* lit_c_out, size_t* extras_sz_out,
+                                                   uint16_t* max_offset_out) {
+    return zxc_lz77_lazy_parse_spl_impl(ctx, src, src_sz, epoch_mark, min_offset, seq_c_out,
+                                        lit_c_out, extras_sz_out, max_offset_out,
+                                        ZXC_LEVEL_COMPACT);
+}
+
+/**
  * @brief Encodes one block in the SPL format (levels 3 and up).
  *
  * Two parsers feed the same serialiser. Levels 6 and 7 hand the whole parse to
- * zxc_lz77_optimal_parse_spl() and rejoin at @c parse_done; levels 3 to 5 run
- * the lazy loop here, with the search depth, lazy attempts and hash step taken
- * from zxc_get_lz77_params(). Either way the parse yields a literal run plus
- * token, offset and extras streams.
+ * zxc_lz77_optimal_parse_spl(); levels 3 to 5 run an instance of
+ * zxc_lz77_lazy_parse_spl_impl(), with the search depth, lazy attempts and hash
+ * step taken from zxc_get_lz77_params(). Either way the parse yields a literal
+ * run plus token, offset and extras streams.
  *
  * The tail then picks an encoding per section - RAW against RLE for the
  * literals, plus a Huffman candidate from level 6 - sizes the sequence streams,
@@ -1444,14 +1682,6 @@ static int zxc_encode_block_spl(zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRIC
         zxc_lz_seed_dict(src, dict_sz, ctx->hash_table, ctx->hash_tags, ctx->chain_table,
                          epoch_mark, offset_mask, level);
 
-    const uint8_t* ip = src + dict_sz;
-    const uint8_t* iend = src + src_sz;
-    const uint8_t* anchor = ip;
-    const uint8_t* search_limit = iend - ZXC_LZ_SEARCH_MARGIN;
-
-    uint32_t* const hash_table = ctx->hash_table;
-    uint8_t* const hash_tags = ctx->hash_tags;
-    uint16_t* const chain_table = ctx->chain_table;
     uint8_t* const literals = ctx->literals;
     uint8_t* const buf_tokens = ctx->buf_tokens;
     uint16_t* const buf_offsets = ctx->buf_offsets;
@@ -1462,79 +1692,30 @@ static int zxc_encode_block_spl(zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRIC
     size_t extras_sz = 0;
     uint16_t max_offset = 0;  // Track max offset for 1-byte/2-byte mode decision
 
-    // Level 6+: price-based optimal parser (fills outputs and skips the
-    // lazy loop + last_lits handling below via `goto parse_done`).
+    // Level 6+: price-based optimal parser; below it, the lazy loop built for
+    // the level at hand.
+    int parse_rc;
     if (level >= ZXC_LEVEL_DENSITY) {
-        const int rc = zxc_lz77_optimal_parse_spl(
-            ctx, src, src_sz, hash_table, hash_tags, chain_table, epoch_mark, offset_mask, level,
-            literals, buf_tokens, buf_offsets, buf_extras, &seq_c, &lit_c, &extras_sz, &max_offset);
-        if (UNLIKELY(rc != 0)) return rc;
-        goto parse_done;
+        parse_rc = zxc_lz77_optimal_parse_spl(ctx, src, src_sz, ctx->hash_table, ctx->hash_tags,
+                                              ctx->chain_table, epoch_mark, offset_mask, level,
+                                              literals, buf_tokens, buf_offsets, buf_extras, &seq_c,
+                                              &lit_c, &extras_sz, &max_offset);
+    } else if (level == ZXC_LEVEL_DEFAULT) {
+        parse_rc = zxc_lz77_lazy_parse_spl_l3(ctx, src, src_sz, epoch_mark, lzp.min_offset, &seq_c,
+                                              &lit_c, &extras_sz, &max_offset);
+    } else if (level == ZXC_LEVEL_BALANCED) {
+        parse_rc = zxc_lz77_lazy_parse_spl_l4(ctx, src, src_sz, epoch_mark, lzp.min_offset, &seq_c,
+                                              &lit_c, &extras_sz, &max_offset);
+    } else {
+        parse_rc = zxc_lz77_lazy_parse_spl_l5(ctx, src, src_sz, epoch_mark, lzp.min_offset, &seq_c,
+                                              &lit_c, &extras_sz, &max_offset);
     }
+    if (UNLIKELY(parse_rc != ZXC_OK)) return parse_rc;
 
-    while (LIKELY(ip < search_limit)) {
-        const size_t dist = (size_t)(ip - anchor);
-        size_t step = lzp.step_base + (dist >> lzp.step_shift);
-        if (UNLIKELY(ip + step >= search_limit)) step = 1;
-
-        if (LIKELY(ip + step + sizeof(uint64_t) <= iend)) {
-            const uint64_t v_next = zxc_le64(ip + step);
-            // cppcheck-suppress unreadVariable
-            const uint32_t h_next = zxc_hash_func(v_next, 1);
-            ZXC_PREFETCH_READ(&hash_tags[h_next]);
-            ZXC_PREFETCH_READ(&hash_table[h_next]);
-        }
-
-        const zxc_match_t m =
-            zxc_lz77_find_best_match(src, ip, iend, search_limit, anchor, hash_table, hash_tags,
-                                     chain_table, epoch_mark, offset_mask, level, lzp,
-                                     /*last_off=*/0U);
-
-        if (m.ref) {
-            ip -= m.backtrack;
-            const uint32_t ll = (uint32_t)(ip - anchor);
-            const uint32_t ml = m.len - ZXC_LZ_MIN_MATCH_LEN;
-            const uint32_t off = (uint32_t)(ip - m.ref);
-            const uint16_t off_biased = (uint16_t)(off - ZXC_LZ_OFFSET_BIAS);
-
-            if (ll > 0) zxc_flush_literals(literals, &lit_c, anchor, ll, iend);
-
-            if (UNLIKELY(!zxc_spl_put_seq(buf_tokens, buf_offsets, buf_extras, &seq_c, &extras_sz,
-                                          &max_offset, ll, ml, off_biased)))
-                return ZXC_ERROR_OVERFLOW;
-
-            if (m.len > 2 && level > ZXC_LEVEL_BALANCED) {
-                const uint8_t* match_end = ip + m.len;
-                if (match_end < iend - 7) {
-                    const uint32_t pos_u = (uint32_t)((match_end - 2) - src);
-                    const uint64_t val_u8 = zxc_le64(match_end - 2);
-                    const uint32_t val_u = (uint32_t)val_u8;
-                    const uint32_t h_u = zxc_hash_func(val_u8, 1);
-                    const uint32_t prev_idx =
-                        zxc_epoch_pos(hash_table[h_u], offset_mask, epoch_mark);
-                    hash_table[h_u] = epoch_mark | pos_u;
-                    hash_tags[h_u] = zxc_hash_tag(val_u);
-                    chain_table[pos_u & ZXC_LZ_WINDOW_MASK] = zxc_chain_delta(pos_u, prev_idx);
-                }
-            }
-
-            ip += m.len;
-            anchor = ip;
-        } else {
-            ip += step;
-        }
-    }
-
-    const size_t last_lits = (size_t)(iend - anchor);
-    if (last_lits > 0) {
-        ZXC_MEMCPY(literals + lit_c, anchor, last_lits);
-        lit_c += last_lits;
-    }
-
-parse_done:;
     // Per-block match splitting on the parsed block (see zxc_spl_match_split_block).
-    seq_c = zxc_spl_match_split_block(buf_tokens, buf_offsets, buf_extras, &extras_sz,
-                                      ctx->buf_split, ctx->buf_split_hist, seq_c, lzp.split_max);
+    seq_c = zxc_spl_match_split_block(
+        buf_tokens, buf_offsets, buf_extras, &extras_sz, ctx->buf_split, ctx->buf_split_hist, seq_c,
+        lit_c, (max_offset <= UINT8_MAX) ? 1U : 2U, lzp.split_max, ctx->split_budget_pct);
     // Dictionary-table trainer hook: accumulate the REAL post-LZ literal
     // frequencies (see zxc_dict_train_huf). Cold path, NULL outside training.
     if (UNLIKELY(ctx->lit_freq_acc)) {
@@ -1780,6 +1961,7 @@ parse_done:;
     // bitstream minus the 128-byte header, so it stays viable far below
     // ZXC_HUF_MIN_LITERALS. A literal without a code drops the candidate.
     size_t huf_dict_total_size = SIZE_MAX;
+#ifndef ZXC_NO_DICT
     if (level >= ZXC_LEVEL_DENSITY && ctx->dict_huf_tree_ok && lit_c > 0) {
         // The dict candidate runs on sections too small for the per-block
         // table, so the histogram may not have been built above.
@@ -1801,6 +1983,7 @@ parse_done:;
             if (huf_dict_j < best_j) enc_lit = ZXC_SECTION_ENCODING_HUFFMAN_DICT;
         }
     }
+#endif
 
     // Level-7 (ULTRA): Huffman-code the token stream with the literal codec -
     // tokens are a <= 256-symbol alphabet. Same J rule; the decoder picks the
@@ -1829,7 +2012,7 @@ parse_done:;
     uint8_t* const p = dst + ZXC_BLOCK_HEADER_SIZE;
     size_t rem = dst_cap - ZXC_BLOCK_HEADER_SIZE;
 
-    const int use_8bit_off = (max_offset <= 255) ? 1 : 0;
+    const int use_8bit_off = (max_offset <= UINT8_MAX) ? 1 : 0;
     const size_t off_stream_size = use_8bit_off ? seq_c : (seq_c * 2);
 
     const zxc_gnr_header_t gh = {.n_sequences = seq_c,
@@ -1861,6 +2044,7 @@ parse_done:;
         if (UNLIKELY(written < 0)) return written;
         if (UNLIKELY((size_t)written != huf_total_size)) return ZXC_ERROR_DST_TOO_SMALL;
         p_curr += written;
+#ifndef ZXC_NO_DICT
     } else if (enc_lit == ZXC_SECTION_ENCODING_HUFFMAN_DICT) {
         const int written =
             zxc_huf_encode_section_dict(literals, lit_c, lit_freq, ctx->dict_huf->code_len,
@@ -1868,6 +2052,7 @@ parse_done:;
         if (UNLIKELY(written < 0)) return written;
         if (UNLIKELY((size_t)written != huf_dict_total_size)) return ZXC_ERROR_DST_TOO_SMALL;
         p_curr += written;
+#endif
     } else if (enc_lit == ZXC_SECTION_ENCODING_RLE) {
         // Write RLE - optimized single-pass encoding
         const uint8_t* lit_ptr = literals;
@@ -1999,6 +2184,130 @@ parse_done:;
 }
 
 /**
+ * @brief Greedy parse of one PAK block (levels 1 and 2), PAK twin of
+ *        zxc_lz77_lazy_parse_spl_impl(): @p level is a constant at each instance.
+ *
+ * @param[in,out] ctx          Compression context: hash and chain tables, buffers.
+ * @param[in]     src          Input, prefixed by the dictionary content when one is active.
+ * @param[in]     src_sz       Size of @p src, that prefix included.
+ * @param[in]     epoch_mark   Current epoch, shifted into the slot's epoch bits.
+ * @param[in]     min_offset   Shortest match distance the parser may emit.
+ * @param[out]    seq_c_out    Number of emitted sequences.
+ * @param[out]    lit_c_out    Number of literal bytes staged.
+ * @param[out]    extras_c_out Bytes written to the extras stream.
+ * @param[in]     level        Compression level, a compile-time constant.
+ * @return @ref ZXC_OK, or @ref ZXC_ERROR_OVERFLOW; the outputs are set on success only.
+ */
+static ZXC_ALWAYS_INLINE int zxc_lz77_lazy_parse_pak_impl(
+    zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRICT src, const size_t src_sz,
+    const uint32_t epoch_mark, const uint32_t min_offset, uint32_t* RESTRICT seq_c_out,
+    size_t* RESTRICT lit_c_out, size_t* RESTRICT extras_c_out, const int level) {
+    zxc_lz77_params_t lzp = zxc_get_lz77_params(level);
+    lzp.min_offset = min_offset;
+    const uint32_t offset_mask = ctx->offset_mask;
+
+    const uint8_t* ip = src + ctx->dict_size;
+    const uint8_t* iend = src + src_sz;
+    const uint8_t* anchor = ip;
+    const uint8_t* search_limit = iend - ZXC_LZ_SEARCH_MARGIN;
+
+    uint32_t* const hash_table = ctx->hash_table;
+    uint8_t* const hash_tags = ctx->hash_tags;
+    uint8_t* const buf_extras = ctx->buf_extras;
+    uint16_t* const chain_table = ctx->chain_table;
+    uint8_t* const literals = ctx->literals;
+    uint32_t* const buf_sequences = ctx->buf_sequences;
+
+    uint32_t seq_c = 0;
+    size_t extras_c = 0;
+    size_t lit_c = 0;
+
+    const int use_hash5 = zxc_lz77_use_hash5(level);
+
+    while (LIKELY(ip < search_limit)) {
+        uint32_t h = zxc_hash_func(zxc_le64(ip), use_hash5);
+
+        // One pass per unmatched position: the hash taken to prefetch the next
+        // position's slots is the one the finder needs there. PAK skips far more
+        // positions than SPL, whose lazy loop gains nothing from carrying it.
+        for (;;) {
+            const size_t dist = (size_t)(ip - anchor);
+            size_t step = lzp.step_base + (dist >> lzp.step_shift);
+            if (UNLIKELY(ip + step >= search_limit)) step = 1;
+
+            ZXC_PREFETCH_READ(ip + step * 4 + ZXC_CACHE_LINE_SIZE);
+
+            // ip + step <= search_limit either way, so this read stays in the block.
+            const uint32_t h_next = zxc_hash_func(zxc_le64(ip + step), use_hash5);
+            ZXC_PREFETCH_READ(&hash_tags[h_next]);
+            ZXC_PREFETCH_READ(&hash_table[h_next]);
+
+            const zxc_match_t m = zxc_lz77_find_best_match(
+                src, ip, h, iend, search_limit, anchor, hash_table, hash_tags, chain_table,
+                epoch_mark, offset_mask, level, lzp, /*last_off=*/0U);
+
+            if (m.ref) {
+                ip -= m.backtrack;
+                const uint32_t ll = (uint32_t)(ip - anchor);
+                const uint32_t ml = m.len - ZXC_LZ_MIN_MATCH_LEN;
+                const uint32_t off = (uint32_t)(ip - m.ref);
+
+                if (ll > 0) zxc_flush_literals(literals, &lit_c, anchor, ll, iend);
+
+                const uint32_t ll_write = (ll >= ZXC_SEQ_LL_MASK) ? ZXC_SEQ_LL_MASK : ll;
+                const uint32_t ml_write = (ml >= ZXC_SEQ_ML_MASK) ? ZXC_SEQ_ML_MASK : ml;
+                const uint32_t seq_val = (ll_write << ZXC_SEQ_LL_SHIFT) |
+                                         (ml_write << ZXC_SEQ_ML_SHIFT) |
+                                         ((off - ZXC_LZ_OFFSET_BIAS) & ZXC_SEQ_OFF_MASK);
+                buf_sequences[seq_c] = seq_val;
+                seq_c++;
+
+                if (UNLIKELY(!zxc_emit_extra(buf_extras, &extras_c, ll, ZXC_SEQ_LL_MASK) ||
+                             !zxc_emit_extra(buf_extras, &extras_c, ml, ZXC_SEQ_ML_MASK)))
+                    return ZXC_ERROR_OVERFLOW;
+
+                ip += m.len;
+                anchor = ip;
+                break;
+            }
+
+            ip += step;
+            if (UNLIKELY(ip >= search_limit)) break;
+            h = h_next;
+        }
+    }
+
+    const size_t last_lits = (size_t)(iend - anchor);
+    if (last_lits > 0) {
+        ZXC_MEMCPY(literals + lit_c, anchor, last_lits);
+        lit_c += last_lits;
+    }
+
+    *seq_c_out = seq_c;
+    *lit_c_out = lit_c;
+    *extras_c_out = extras_c;
+    return ZXC_OK;
+}
+
+static ZXC_NOINLINE int zxc_lz77_lazy_parse_pak_l1(zxc_cctx_t* RESTRICT ctx,
+                                                   const uint8_t* RESTRICT src, const size_t src_sz,
+                                                   const uint32_t epoch_mark,
+                                                   const uint32_t min_offset, uint32_t* seq_c_out,
+                                                   size_t* lit_c_out, size_t* extras_c_out) {
+    return zxc_lz77_lazy_parse_pak_impl(ctx, src, src_sz, epoch_mark, min_offset, seq_c_out,
+                                        lit_c_out, extras_c_out, ZXC_LEVEL_FASTEST);
+}
+
+static ZXC_NOINLINE int zxc_lz77_lazy_parse_pak_l2(zxc_cctx_t* RESTRICT ctx,
+                                                   const uint8_t* RESTRICT src, const size_t src_sz,
+                                                   const uint32_t epoch_mark,
+                                                   const uint32_t min_offset, uint32_t* seq_c_out,
+                                                   size_t* lit_c_out, size_t* extras_c_out) {
+    return zxc_lz77_lazy_parse_pak_impl(ctx, src, src_sz, epoch_mark, min_offset, seq_c_out,
+                                        lit_c_out, extras_c_out, ZXC_LEVEL_FAST);
+}
+
+/**
  * @brief Encodes one block in the PAK format (levels 1 and 2, the speed path).
  *
  * What sets PAK apart is the sequence record. SPL packs a 1-byte token (4-bit
@@ -2044,74 +2353,21 @@ static int zxc_encode_block_pak(zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRIC
         zxc_lz_seed_dict(src, dict_sz, ctx->hash_table, ctx->hash_tags, ctx->chain_table,
                          epoch_mark, offset_mask, level);
 
-    const uint8_t* ip = src + dict_sz;
-    const uint8_t* iend = src + src_sz;
-    const uint8_t* anchor = ip;
-    const uint8_t* search_limit = iend - ZXC_LZ_SEARCH_MARGIN;
-
-    uint32_t* const hash_table = ctx->hash_table;
-    uint8_t* const hash_tags = ctx->hash_tags;
-    uint8_t* const buf_extras = ctx->buf_extras;
-    uint16_t* const chain_table = ctx->chain_table;
-    uint8_t* const literals = ctx->literals;
-    uint32_t* const buf_sequences = ctx->buf_sequences;
+    const uint8_t* const literals = ctx->literals;
+    const uint8_t* const buf_extras = ctx->buf_extras;
+    const uint32_t* const buf_sequences = ctx->buf_sequences;
 
     uint32_t seq_c = 0;
     size_t extras_c = 0;
     size_t lit_c = 0;
 
-    while (LIKELY(ip < search_limit)) {
-        size_t dist = (size_t)(ip - anchor);
-        size_t step = lzp.step_base + (dist >> lzp.step_shift);
-        if (UNLIKELY(ip + step >= search_limit)) step = 1;
-
-        ZXC_PREFETCH_READ(ip + step * 4 + ZXC_CACHE_LINE_SIZE);
-
-        if (LIKELY(ip + step + sizeof(uint64_t) <= iend)) {
-            const uint64_t v_next = zxc_le64(ip + step);
-            // cppcheck-suppress unreadVariable
-            const uint32_t h_next = zxc_hash_func(v_next, 0);
-            ZXC_PREFETCH_READ(&hash_tags[h_next]);
-            ZXC_PREFETCH_READ(&hash_table[h_next]);
-        }
-
-        const zxc_match_t m =
-            zxc_lz77_find_best_match(src, ip, iend, search_limit, anchor, hash_table, hash_tags,
-                                     chain_table, epoch_mark, offset_mask, level, lzp,
-                                     /*last_off=*/0U);
-
-        if (m.ref) {
-            ip -= m.backtrack;
-            const uint32_t ll = (uint32_t)(ip - anchor);
-            const uint32_t ml = m.len - ZXC_LZ_MIN_MATCH_LEN;
-            const uint32_t off = (uint32_t)(ip - m.ref);
-
-            if (ll > 0) zxc_flush_literals(literals, &lit_c, anchor, ll, iend);
-
-            const uint32_t ll_write = (ll >= ZXC_SEQ_LL_MASK) ? ZXC_SEQ_LL_MASK : ll;
-            const uint32_t ml_write = (ml >= ZXC_SEQ_ML_MASK) ? ZXC_SEQ_ML_MASK : ml;
-            const uint32_t seq_val = (ll_write << ZXC_SEQ_LL_SHIFT) |
-                                     (ml_write << ZXC_SEQ_ML_SHIFT) |
-                                     ((off - ZXC_LZ_OFFSET_BIAS) & ZXC_SEQ_OFF_MASK);
-            buf_sequences[seq_c] = seq_val;
-            seq_c++;
-
-            if (UNLIKELY(!zxc_emit_extra(buf_extras, &extras_c, ll, ZXC_SEQ_LL_MASK) ||
-                         !zxc_emit_extra(buf_extras, &extras_c, ml, ZXC_SEQ_ML_MASK)))
-                return ZXC_ERROR_OVERFLOW;
-
-            ip += m.len;
-            anchor = ip;
-        } else {
-            ip += step;
-        }
-    }
-
-    const size_t last_lits = (size_t)(iend - anchor);
-    if (last_lits > 0) {
-        ZXC_MEMCPY(literals + lit_c, anchor, last_lits);
-        lit_c += last_lits;
-    }
+    const int parse_rc =
+        (level == ZXC_LEVEL_FAST)
+            ? zxc_lz77_lazy_parse_pak_l2(ctx, src, src_sz, epoch_mark, lzp.min_offset, &seq_c,
+                                         &lit_c, &extras_c)
+            : zxc_lz77_lazy_parse_pak_l1(ctx, src, src_sz, epoch_mark, lzp.min_offset, &seq_c,
+                                         &lit_c, &extras_c);
+    if (UNLIKELY(parse_rc != ZXC_OK)) return parse_rc;
 
     zxc_block_header_t bh = {.block_type = ZXC_BLOCK_PAK};
     uint8_t* const p = dst + ZXC_BLOCK_HEADER_SIZE;
@@ -2249,3 +2505,5 @@ int zxc_compress_chunk_wrapper(zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRICT
 
     return (int)w;
 }
+
+#endif  // ZXC_VARIANT_PRIMARY || !ZXC_ENCODER_DEFAULT
