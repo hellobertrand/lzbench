@@ -1293,7 +1293,9 @@ typedef struct {
     zxc_dctx *dctx;
 } zxc_bench_t;
 
-char *lzbench_zxc_init(size_t insize, size_t level, size_t)
+// additional_param: ZXC_C_FAVOR_DECODE_SPEED budget in percent, 0 = off
+// (zxc_ds: 25, as zxc --favor-decode-speed=25).
+char *lzbench_zxc_init(size_t insize, size_t level, size_t decode_speed_budget)
 {
     zxc_bench_t *bench = (zxc_bench_t *)malloc(sizeof(zxc_bench_t));
     if (!bench)
@@ -1305,7 +1307,9 @@ char *lzbench_zxc_init(size_t insize, size_t level, size_t)
     /* Level 1-7 on the context. Default block size; otherwise a power of 2 in [4K, 2MB]. */
     if (!bench->cctx || !bench->dctx ||
         zxc_cctx_set_param(bench->cctx, ZXC_C_LEVEL, (int64_t)level) != ZXC_OK ||
-        zxc_cctx_set_param(bench->cctx, ZXC_C_BLOCK_SIZE, ZXC_BLOCK_SIZE_DEFAULT) != ZXC_OK)
+        zxc_cctx_set_param(bench->cctx, ZXC_C_BLOCK_SIZE, ZXC_BLOCK_SIZE_DEFAULT) != ZXC_OK ||
+        zxc_cctx_set_param(bench->cctx, ZXC_C_FAVOR_DECODE_SPEED,
+                           (int64_t)decode_speed_budget) != ZXC_OK)
     {
         if (bench->cctx) zxc_free_cctx(bench->cctx);
         if (bench->dctx) zxc_free_dctx(bench->dctx);
