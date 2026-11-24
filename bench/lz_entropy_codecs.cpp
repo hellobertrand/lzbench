@@ -1294,7 +1294,7 @@ typedef struct {
 } zxc_bench_t;
 
 // additional_param: ZXC_C_FAVOR_DECODE_SPEED budget in percent, 0 = off
-// (zxc_ds: 25, as zxc --favor-decode-speed=25).
+// (zxc_ds: 25, what the CLI's bare --favor-decode-speed sets).
 char *lzbench_zxc_init(size_t insize, size_t level, size_t decode_speed_budget)
 {
     zxc_bench_t *bench = (zxc_bench_t *)malloc(sizeof(zxc_bench_t));
