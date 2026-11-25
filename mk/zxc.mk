@@ -11,21 +11,19 @@ endif
 
 ZXC_OBJS := $(addprefix $(ZXC_DIR)/, zxc_common.o zxc_dict.o zxc_dispatch.o zxc_driver.o \
     zxc_pivco_tables.o zxc_pstream.o zxc_seekable.o \
-    zxc_compress_default.o zxc_decompress_default.o zxc_huffman_default.o zxc_checksum_default.o)
+    zxc_compress_default.o zxc_decompress_default.o zxc_huffman_default.o)
 ifneq (,$(filter x86_64% amd64%,$(TARGET_ARCH)))
     ZXC_OBJS += $(addprefix $(ZXC_DIR)/, zxc_compress_avx2.o zxc_decompress_avx2.o zxc_huffman_avx2.o \
-        zxc_checksum_avx2.o zxc_compress_avx512.o zxc_decompress_avx512.o zxc_huffman_avx512.o \
-        zxc_checksum_avx512.o)
+        zxc_compress_avx512.o zxc_decompress_avx512.o zxc_huffman_avx512.o)
 endif
 # 32-bit ARM only (AArch64's NEON tier is _default).
 ifneq (,$(filter arm% aarch64%,$(TARGET_ARCH)))
     ifeq (,$(filter arm64% aarch64%,$(TARGET_ARCH)))
-        ZXC_OBJS += $(addprefix $(ZXC_DIR)/, zxc_compress_neon32.o zxc_decompress_neon32.o zxc_huffman_neon32.o \
-            zxc_checksum_neon32.o)
+        ZXC_OBJS += $(addprefix $(ZXC_DIR)/, zxc_compress_neon32.o zxc_decompress_neon32.o zxc_huffman_neon32.o)
         ZXC_NEON_FLAGS := -march=armv7-a -mfpu=neon
     endif
 endif
-ZXC_FLAGS = -I$(SRC)$(ZXC_DIR)/vendors/rapidhash $(ZXC_ISA_FLAGS)
+ZXC_FLAGS = -I$(SRC)$(ZXC_DIR)/vendors $(ZXC_ISA_FLAGS)
 
 $(ZXC_DIR)/%_default.o: ZXC_ISA_FLAGS := -DZXC_FUNCTION_SUFFIX=_default
 $(ZXC_DIR)/%_avx2.o:    ZXC_ISA_FLAGS := -mavx2 -mbmi -mbmi2 -mlzcnt -mno-avx512f -DZXC_FUNCTION_SUFFIX=_avx2 -DZXC_USE_AVX2
